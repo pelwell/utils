@@ -175,13 +175,15 @@ struct pio_chip {
     void (*pio_sm_put)(PIO pio, uint sm, uint32_t data, bool blocking);
     uint32_t (*pio_sm_get)(PIO pio, uint sm, bool blocking);
     void (*pio_sm_set_dmactrl)(PIO pio, uint sm, bool is_tx, uint32_t ctrl);
+    uint32_t (*pio_sm_get_dmactrl)(PIO pio, uint sm, bool is_tx);
+    uint32_t (*pio_sm_get_flags)(PIO pio, uint sm, uint32_t flags, bool clear, uint32_t timeout);
+    void (*pio_sm_drain_tx_fifo)(PIO pio, uint sm);
     bool (*pio_sm_is_rx_fifo_empty)(PIO pio, uint sm);
     bool (*pio_sm_is_rx_fifo_full)(PIO pio, uint sm);
     uint (*pio_sm_get_rx_fifo_level)(PIO pio, uint sm);
     bool (*pio_sm_is_tx_fifo_empty)(PIO pio, uint sm);
     bool (*pio_sm_is_tx_fifo_full)(PIO pio, uint sm);
     uint (*pio_sm_get_tx_fifo_level)(PIO pio, uint sm);
-    void (*pio_sm_drain_tx_fifo)(PIO pio, uint sm);
 
     pio_sm_config (*pio_get_default_sm_config)(PIO pio);
     void (*smc_set_out_pins)(PIO pio, pio_sm_config *c, uint out_base, uint out_count);
@@ -626,6 +628,30 @@ static inline void pio_sm_set_dmactrl(PIO pio, uint sm, bool is_tx, uint32_t ctr
     check_pio_param(pio);
     pio->chip->pio_sm_set_dmactrl(pio, sm, is_tx, ctrl);
 };
+
+static inline uint32_t pio_sm_get_dmactrl(PIO pio, uint sm, bool is_tx)
+{
+    check_pio_param(pio);
+    return pio->chip->pio_sm_get_dmactrl(pio, sm, is_tx);
+};
+
+static inline uint32_t pio_sm_wait_flags(PIO pio, uint sm, uint32_t flags, bool clear, uint32_t timeout)
+{
+    check_pio_param(pio);
+    return pio->chip->pio_sm_get_flags(pio, sm, flags, clear, timeout);
+}
+
+static inline uint32_t pio_sm_get_flags(PIO pio, uint sm, uint32_t flags, bool clear)
+{
+    check_pio_param(pio);
+    return pio->chip->pio_sm_get_flags(pio, sm, flags, clear, 0);
+}
+
+static inline void pio_sm_clear_flags(PIO pio, uint sm, uint32_t flags)
+{
+    check_pio_param(pio);
+    (void)pio->chip->pio_sm_get_flags(pio, sm, flags, true, 0);
+}
 
 static inline bool pio_sm_is_rx_fifo_empty(PIO pio, uint sm)
 {

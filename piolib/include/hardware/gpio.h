@@ -56,6 +56,15 @@ enum gpio_drive_strength {
     GPIO_DRIVE_STRENGTH_12MA = 3 ///< 12 mA nominal drive strength
 };
 
+enum pio_sm_flags {
+    PIO_SM_FLAG_TXSTALL = 0x0001,
+    PIO_SM_FLAG_RXSTALL = 0x0002,
+    PIO_SM_FLAG_TXOVER  = 0x0004,
+    PIO_SM_FLAG_RXUNDER = 0x0008,
+
+    PIO_SM_FLAG_ALL     = 0x000f,
+};
+
 static inline void check_gpio_param(__unused uint gpio) {
     invalid_params_if(GPIO, gpio >= NUM_BANK0_GPIOS);
 }

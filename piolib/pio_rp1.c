@@ -537,6 +537,30 @@ static void rp1_pio_sm_set_dmactrl(PIO pio, uint sm, bool is_tx, uint32_t ctrl)
     (void)rp1_ioctl(pio, PIO_IOC_SM_SET_DMACTRL, &args);
 }
 
+static uint32_t rp1_pio_sm_get_dmactrl(PIO pio, uint sm, bool is_tx)
+{
+    struct rp1_pio_sm_set_dmactrl_args args = { .sm = sm, .is_tx = is_tx, .ctrl = 0 };
+
+    check_sm_param(sm);
+
+    if (rp1_ioctl(pio, PIO_IOC_SM_GET_DMACTRL, &args) < 0)
+        pio_panic("Failed to get DMACTRL");
+
+    return args.ctrl;
+}
+
+static uint32_t rp1_pio_sm_get_flags(PIO pio, uint sm, uint32_t flags, bool clear, uint32_t timeout)
+{
+    struct rp1_pio_sm_get_flags_args args = { .sm = sm, .flags = flags, .clear = clear, .timeout = timeout };
+
+    check_sm_param(sm);
+
+    if (rp1_ioctl(pio, PIO_IOC_SM_GET_FLAGS, &args) < 0)
+        pio_panic("Failed to get FIFO flags");
+
+    return args.flags;
+}
+
 static bool rp1_pio_sm_is_rx_fifo_empty(PIO pio, uint sm)
 {
     struct rp1_pio_sm_fifo_state_args args = { .sm = sm, .tx = false };
@@ -934,6 +958,8 @@ DECLARE_PIO_CHIP(rp1) {
     .pio_sm_put = rp1_pio_sm_put,
     .pio_sm_get = rp1_pio_sm_get,
     .pio_sm_set_dmactrl = rp1_pio_sm_set_dmactrl,
+    .pio_sm_get_dmactrl = rp1_pio_sm_get_dmactrl,
+    .pio_sm_get_flags = rp1_pio_sm_get_flags,
     .pio_sm_is_rx_fifo_empty = rp1_pio_sm_is_rx_fifo_empty,
     .pio_sm_is_rx_fifo_full = rp1_pio_sm_is_rx_fifo_full,
     .pio_sm_get_rx_fifo_level = rp1_pio_sm_get_rx_fifo_level,

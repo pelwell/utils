@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 /*
- * Copyright (c) 2023-24 Raspberry Pi Ltd.
+ * Copyright (c) 2023-26 Raspberry Pi Ltd.
  * All rights reserved.
  */
 #ifndef _RP1_PIO_IF_H
@@ -124,13 +124,28 @@ struct rp1_pio_sm_set_dmactrl_args {
     uint32_t ctrl;
 };
 
+struct rp1_pio_sm_get_dmactrl_args {
+    uint16_t sm;
+    uint8_t is_tx;
+    uint8_t rsvd;
+    uint32_t ctrl; /* OUT */
+};
+
 struct rp1_pio_sm_fifo_state_args {
-	uint16_t sm;
-	uint8_t tx;
-	uint8_t rsvd;
-	uint16_t level; /* OUT */
-	uint8_t empty; /* OUT */
-	uint8_t full; /* OUT */
+    uint16_t sm;
+    uint8_t tx;
+    uint8_t rsvd;
+    uint16_t level; /* OUT */
+    uint8_t empty; /* OUT */
+    uint8_t full; /* OUT */
+};
+
+struct rp1_pio_sm_get_flags_args {
+    uint16_t sm;
+    uint8_t clear;
+    uint8_t rsvd;
+    uint32_t flags; /* IN/OUT */
+    uint32_t timeout;
 };
 
 struct rp1_gpio_init_args {
@@ -223,6 +238,8 @@ struct rp1_access_hw_args {
 #define PIO_IOC_SM_SET_DMACTRL _IOW(PIO_IOC_MAGIC, 43, struct rp1_pio_sm_set_dmactrl_args)
 #define PIO_IOC_SM_FIFO_STATE _IOW(PIO_IOC_MAGIC, 44, struct rp1_pio_sm_fifo_state_args)
 #define PIO_IOC_SM_DRAIN_TX _IOW(PIO_IOC_MAGIC, 45, struct rp1_pio_sm_clear_fifos_args)
+#define PIO_IOC_SM_GET_FLAGS _IOWR(PIO_IOC_MAGIC, 46, struct rp1_pio_sm_get_flags_args)
+#define PIO_IOC_SM_GET_DMACTRL _IOWR(PIO_IOC_MAGIC, 47, struct rp1_pio_sm_get_dmactrl_args)
 
 #define PIO_IOC_GPIO_INIT _IOW(PIO_IOC_MAGIC, 50, struct rp1_gpio_init_args)
 #define PIO_IOC_GPIO_SET_FUNCTION _IOW(PIO_IOC_MAGIC, 51, struct rp1_gpio_set_function_args)
