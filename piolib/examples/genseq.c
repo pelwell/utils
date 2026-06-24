@@ -39,27 +39,28 @@ int main(int argc, const char **argv) {
 
     for (i = 0; i < DATA_WORDS; i++) {
         printf("Iter %d:\n", i);
+        if (pio_sm_get_rx_fifo_level(pio, sm) != 0) {
+            printf("Fifo not empty (%d)!\n", pio_sm_get_rx_fifo_level(pio, sm));
+            exit(1);
+        }
         pio_sm_put_blocking(pio, sm, i);
         if (use_dma) {
             ret = pio_sm_xfer_data(pio, sm, PIO_DIR_FROM_SM, (i + 1) * sizeof(databuf[0]), databuf);
             if (ret)
                break;
-
-            for (j = i; j >= 0; j--)
-            {
-                int v = databuf[i - j];
-                if (v != j)
-                    printf(" %d: %d\n", j, v);
-            }
         } else {
             for (j = i; j >= 0; j--)
             {
-                int v = pio_sm_get_blocking(pio, sm);
-                if (v != j)
-                    printf(" %d: %d\n", j, v);
+                databuf[i - j] = pio_sm_get(pio, sm);
             }
         }
-        sleep_ms(10);
+
+        for (j = i; j >= 0; j--)
+        {
+            int v = databuf[i - j];
+            if (v != j)
+                printf(" %d: %d\n", j, v);
+        }
     }
 
     if (ret)
