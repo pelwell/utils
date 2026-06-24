@@ -64,3 +64,8 @@ add_executable(blockingtest blockingtest.c)
 target_include_directories(blockingtest PRIVATE ../include)
 target_link_libraries(blockingtest pio pthread)
 install(TARGETS blockingtest RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+add_executable(irqtest irqtest.c)
+target_include_directories(irqtest PRIVATE ../include ../../pinctrl)
+target_link_libraries(irqtest pio gpiolib)
+install(TARGETS irqtest RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
