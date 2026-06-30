@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <malloc.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -76,10 +77,15 @@
 #include "hardware/regs/proc_pio.h"
 #include "rp1_pio_if.h"
 
+#define NUM_SM_IRQS (PROC_PIO_IRQ_MSB - PROC_PIO_IRQ_LSB + 1)
+
 typedef struct rp1_pio_handle {
     struct pio_instance base;
     const char *devname;
     int fd;
+    bool irq_thread_running;
+    pthread_mutex_t lock;
+    pthread_t irq_thread;
 } *RP1_PIO;
 
 #define smc_to_rp1(_config, _c) rp1_pio_sm_config *_c = (rp1_pio_sm_config*)_config
@@ -846,6 +852,88 @@ static void rp1_pio_gpio_init(PIO pio, uint pin)
     rp1_gpio_set_function(pio, pin, RP1_GPIO_FUNC_PIO);
 }
 
+static void rp1_pio_irq_set_enabled(PIO pio, uint irq_index, bool enabled)
+{
+    struct rp1_pio_irq_set_enabled_args args = { .irq_index = irq_index, .enabled = enabled };
+    valid_params_if(PIO, irq_index < RP1_PIO_IRQ_COUNT);
+    (void)rp1_ioctl(pio, PIO_IOC_IRQ_SET_ENABLED, &args);
+}
+
+static bool rp1_pio_irq_is_enabled(PIO pio, uint irq_index)
+{
+    struct rp1_pio_irq_set_enabled_args args = { .irq_index = irq_index };
+    valid_params_if(PIO, irq_index < RP1_PIO_IRQ_COUNT);
+    (void)rp1_ioctl(pio, PIO_IOC_IRQ_IS_ENABLED, &args);
+    return args.enabled;
+}
+
+static void rp1_pio_set_irqn_source_mask_enabled(PIO pio, uint irq_index, uint32_t source_mask, bool enabled)
+{
+    struct rp1_pio_set_irqn_source_mask_enabled_args args =
+        { .irq_index = irq_index, .source_mask = source_mask, .enabled = enabled };
+    valid_params_if(PIO, irq_index < RP1_PIO_IRQ_COUNT);
+    (void)rp1_ioctl(pio, PIO_IOC_SET_IRQN_SOURCE_MASK_ENABLED, &args);
+}
+
+static bool rp1_pio_interrupt_get(PIO pio, uint pio_interrupt_num)
+{
+    struct rp1_pio_interrupt_get_args args = { .pio_interrupt_num = pio_interrupt_num };
+    invalid_params_if(PIO, pio_interrupt_num >= NUM_SM_IRQS);
+    (void)rp1_ioctl(pio, PIO_IOC_INTERRUPT_GET, &args);
+    return !!args.active;
+}
+
+static void rp1_pio_interrupt_clear(PIO pio, uint pio_interrupt_num)
+{
+    struct rp1_pio_interrupt_clear_args args = { .pio_interrupt_num = pio_interrupt_num };
+    invalid_params_if(PIO, pio_interrupt_num >= NUM_SM_IRQS);
+    (void)rp1_ioctl(pio, PIO_IOC_INTERRUPT_CLEAR, &args);
+}
+
+static void *irq_wait_thread(void *arg) {
+    RP1_PIO rp = (RP1_PIO)arg;
+    struct rp1_pio_irq_wait_args args;
+
+    args.timeout_ms = 0;
+    while (1) {
+        rp1_ioctl(&rp->base, PIO_IOC_IRQ_WAIT, &args);
+        if (!args.active_mask)
+            break;
+        printf("woke %x\n", args.active_mask);
+    }
+
+    return NULL;
+}
+
+static void rp1_pio_irq_start_thread(PIO pio) {
+    RP1_PIO rp = (RP1_PIO)pio;
+    pthread_mutex_lock(&rp->lock);
+    if (!rp->irq_thread_running) {
+        if (pthread_create(&rp->irq_thread, NULL, irq_wait_thread, rp))
+            pio_panic("Failed to create irq wait thread!");
+        rp->irq_thread_running = true;
+    }
+    pthread_mutex_unlock(&rp->lock);
+}
+
+static int rp1_pio_irq_claim(PIO pio)
+{
+    struct rp1_pio_irq_claim_args args = { .irq_index = -1 };
+    (void)rp1_ioctl(pio, PIO_IOC_IRQ_CLAIM, &args);
+    if (args.irq_index >= 0)
+        rp1_pio_irq_start_thread(pio);
+    return args.irq_index;
+}
+
+static uint32_t rp1_pio_irq_wait(PIO pio, uint timeout_ms)
+{
+    struct rp1_pio_irq_wait_args args = { .timeout_ms = timeout_ms };
+    int ret = rp1_ioctl(pio, PIO_IOC_IRQ_WAIT, &args);
+    if (ret < 0)
+        return ~0;
+    return args.active_mask;
+}
+
 static PIO rp1_create_instance(PIO_CHIP_T *chip, uint index)
 {
     char pathbuf[20];
@@ -863,8 +951,7 @@ static PIO rp1_create_instance(PIO_CHIP_T *chip, uint index)
     pio->base.chip = chip;
     pio->fd = -1;
     pio->devname = strdup(pathbuf);
-
-    rp1_pio_clear_instruction_memory(&pio->base);
+    pthread_mutex_init(&pio->lock, NULL);
 
     return &pio->base;
 }
@@ -893,6 +980,7 @@ DECLARE_PIO_CHIP(rp1) {
     .instr_count = RP1_PIO_INSTRUCTION_COUNT,
     .sm_count =  RP1_PIO_SM_COUNT,
     .fifo_depth = 8,
+    .irq_count = RP1_PIO_IRQ_COUNT,
 
     .create_instance = rp1_create_instance,
     .open_instance = rp1_open_instance,
@@ -995,4 +1083,12 @@ DECLARE_PIO_CHIP(rp1) {
     .gpio_set_oeover = rp1_gpio_set_oeover,
     .gpio_set_input_enabled = rp1_gpio_set_input_enabled,
     .gpio_set_drive_strength = rp1_gpio_set_drive_strength,
+
+    .set_irqn_source_mask_enabled = rp1_pio_set_irqn_source_mask_enabled,
+    .irq_set_enabled = rp1_pio_irq_set_enabled,
+    .irq_is_enabled = rp1_pio_irq_is_enabled,
+    .pio_interrupt_get = rp1_pio_interrupt_get,
+    .pio_interrupt_clear = rp1_pio_interrupt_clear,
+    .pio_irq_claim = rp1_pio_irq_claim,
+    .pio_irq_wait = rp1_pio_irq_wait,
 };
