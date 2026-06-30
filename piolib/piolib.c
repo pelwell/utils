@@ -18,12 +18,22 @@
 #include "piolib_priv.h"
 
 #define PIO_MAX_INSTANCES 4
+#define PIO_MAX_IRQS 16
 
 static __thread PIO __pio;
+
+struct pio_irq_handler {
+    PIO pio;
+    irq_handler_t handler;
+    void *context;
+};
 
 static PIO pio_instances[PIO_MAX_INSTANCES];
 static uint num_instances;
 static pthread_mutex_t pio_handle_lock;
+static pthread_t pio_irq_threads[PIO_MAX_INSTANCES];
+static struct pio_irq_handler irq_handlers[PIO_MAX_IRQS];
+static uint num_irqs;
 
 void pio_select(PIO pio)
 {
@@ -48,6 +58,27 @@ int pio_get_index(PIO pio)
     return -1;
 }
 
+static void *irq_wait_thread(void *arg) {
+    PIO pio = (PIO)arg;
+
+    while (1) {
+        uint32_t active = pio->chip->pio_irq_wait(pio, 0);
+        uint i;
+        if (active == ~0u)
+            break;
+        for (i = 0; active && i < pio->irq_count; i++) {
+            uint32_t mask = (1 << i);
+            if (active & mask) {
+                struct pio_irq_handler *h = &irq_handlers[pio->irq_base + i];
+                active &= ~mask;
+                (h->handler)(h->context);
+            }
+        }
+    }
+
+    return NULL;
+}
+
 int pio_init(void)
 {
 #if LIBRARY_BUILD
@@ -65,6 +96,7 @@ int pio_init(void)
     if (initialised)
         return 0;
     num_instances = 0;
+    num_irqs = 0;
 
     p = start;
     while (p < end)
@@ -72,6 +104,17 @@ int pio_init(void)
         PIO_CHIP_T *chip = *p;
         PIO pio = chip->create_instance(chip, i);
         if (pio && !PIO_IS_ERR(pio)) {
+            int irq_count = chip->irq_count;
+            if (irq_count) {
+                pio->irq_base = num_irqs;
+                pio->irq_count = irq_count;
+                while (irq_count--) {
+                    struct pio_irq_handler *h = &irq_handlers[num_irqs++];
+                    h->pio = pio;
+                    h->handler = NULL;
+                    pio->irqs[irq_count] = -1;
+                }
+            }
             pio_instances[num_instances++] = pio;
             i++;
         } else {
@@ -92,6 +135,7 @@ PIO pio_open(uint idx)
 {
     PIO pio = NULL;
     int err;
+    uint i;
 
     err = pio_init();
     if (err)
@@ -119,6 +163,12 @@ PIO pio_open(uint idx)
     if (err) {
         pio->in_use = 0;
         return PIO_ERR(err);
+    } else if (pio->irq_count) {
+        for (i = 0; i < pio->irq_count; i++)
+            pio->irqs[i] = -1;
+
+        if (pthread_create(&pio_irq_threads[idx], NULL, irq_wait_thread, pio))
+            pio_panic("Failed to create irq wait thread!");
     }
 
     pio_select(pio);
@@ -175,10 +225,74 @@ void pio_panic(const char *msg)
     exit(1);
 }
 
-void sleep_us(uint64_t us) {
+void sleep_us(uint64_t us)
+{
     const struct timespec tv = {
         .tv_sec = (us / 1000000),
         .tv_nsec = 1000ull * (us % 1000000)
     };
     nanosleep(&tv, NULL);
+}
+
+uint pio_irq_map(PIO pio, uint irq_index) {
+    int pirq;
+    check_pio_param(pio);
+    invalid_params_if(PIO, irq_index > pio->irq_count);
+    pirq = pio->irqs[irq_index];
+    if (pirq < 0) {
+        pirq = pio->chip->pio_irq_claim(pio);
+        if (pirq >= 0) {
+            pio->irqs[irq_index] = pirq;
+        }
+    }
+    if (pirq < 0)
+        pio_panic("Unable to map irq");
+    return (uint)pirq;
+}
+
+static inline void check_irq_param(uint num)
+{
+    if (num >= num_irqs)
+        pio_panic("irq out of range");
+}
+
+void irq_set_handler(uint num, irq_handler_t handler, void *context)
+{
+    struct pio_irq_handler *h = &irq_handlers[num];
+    check_irq_param(num);
+    h->handler = handler;
+    h->context = context;
+}
+
+void irq_remove_handler(uint num, irq_handler_t handler)
+{
+    struct pio_irq_handler *h = &irq_handlers[num];
+    check_irq_param(num);
+    if (h->handler == handler)
+        h->handler = NULL;
+}
+
+irq_handler_t irq_get_handler(uint num)
+{
+    struct pio_irq_handler *h = &irq_handlers[num];
+    check_irq_param(num);
+    return h->handler;
+}
+
+void irq_set_enabled(uint num, bool enabled)
+{
+    struct pio_irq_handler *h = &irq_handlers[num];
+    PIO pio;
+    check_irq_param(num);
+    pio = h->pio;
+    pio->chip->irq_set_enabled(pio, num - pio->irq_base, enabled);
+}
+
+bool irq_is_enabled(uint num)
+{
+    struct pio_irq_handler *h = &irq_handlers[num];
+    PIO pio;
+    check_irq_param(num);
+    pio = h->pio;
+    return pio->chip->irq_is_enabled(pio, num - pio->irq_base);
 }

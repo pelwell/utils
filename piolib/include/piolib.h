@@ -26,7 +26,27 @@ extern "C" {
 #define PIO_ORIGIN_ANY          ((uint)(~0))
 #define PIO_ORIGIN_INVALID      PIO_ORIGIN_ANY
 
+#define MAX_PIO_SMS             4
+#define NUM_PIO_IRQS            2
+
+#ifndef NDEBUG
+#define _PIO_INVALID_IN_SRC    0x08u
+#define _PIO_INVALID_OUT_DEST 0x10u
+#define _PIO_INVALID_SET_DEST 0x20u
+#define _PIO_INVALID_MOV_SRC  0x40u
+#define _PIO_INVALID_MOV_DEST 0x80u
+#else
+#define _PIO_INVALID_IN_SRC    0u
+#define _PIO_INVALID_OUT_DEST 0u
+#define _PIO_INVALID_SET_DEST 0u
+#define _PIO_INVALID_MOV_SRC  0u
+#define _PIO_INVALID_MOV_DEST 0u
+#endif
+
 #define pio0 pio_open_helper(0)
+
+#define irq_add_shared_handler(num, handler, order_priority) \
+	irq_set_handler(num, handler, 0)
 
 enum pio_fifo_join {
 	PIO_FIFO_JOIN_NONE = 0,
@@ -59,20 +79,6 @@ enum pio_instr_bits {
     pio_instr_bits_set = 0xe000,
 };
 
-#ifndef NDEBUG
-#define _PIO_INVALID_IN_SRC    0x08u
-#define _PIO_INVALID_OUT_DEST 0x10u
-#define _PIO_INVALID_SET_DEST 0x20u
-#define _PIO_INVALID_MOV_SRC  0x40u
-#define _PIO_INVALID_MOV_DEST 0x80u
-#else
-#define _PIO_INVALID_IN_SRC    0u
-#define _PIO_INVALID_OUT_DEST 0u
-#define _PIO_INVALID_SET_DEST 0u
-#define _PIO_INVALID_MOV_SRC  0u
-#define _PIO_INVALID_MOV_DEST 0u
-#endif
-
 enum pio_src_dest {
     pio_pins = 0u,
     pio_x = 1u,
@@ -103,12 +109,15 @@ typedef struct {
 typedef struct pio_instance *PIO;
 typedef const struct pio_chip PIO_CHIP_T;
 
+typedef void (*irq_handler_t)(void *);
+
 struct pio_chip {
     const char *name;
     const char *compatible;
     uint16_t instr_count;
     uint16_t sm_count;
     uint16_t fifo_depth;
+    uint16_t irq_count;
     void *hw_state;
 
     PIO (*create_instance)(PIO_CHIP_T *chip, uint index);
@@ -211,11 +220,22 @@ struct pio_chip {
     void (*gpio_set_oeover)(PIO pio, uint gpio, uint value);
     void (*gpio_set_input_enabled)(PIO pio, uint gpio, bool enabled);
     void (*gpio_set_drive_strength)(PIO pio, uint gpio, enum gpio_drive_strength drive);
+
+    void (*set_irqn_source_mask_enabled)(PIO pio, uint irq_index, uint32_t source_mask, bool enabled);
+    void (*irq_set_enabled)(PIO pio, uint num, bool enabled);
+    bool (*irq_is_enabled)(PIO pio, uint num);
+    bool (*pio_interrupt_get)(PIO pio, uint pio_interrupt_num);
+    void (*pio_interrupt_clear)(PIO pio, uint pio_interrupt_num);
+    int  (*pio_irq_claim)(PIO pio);
+    uint32_t (*pio_irq_wait)(PIO pio, uint timeout_ms);
 };
 
 struct pio_instance {
     const PIO_CHIP_T *chip;
     int in_use;
+    uint irq_base;
+    uint irq_count;
+    int irqs[NUM_PIO_IRQS];
     bool errors_are_fatal;
     bool error;
 };
@@ -229,6 +249,12 @@ void pio_panic(const char *msg);
 int pio_get_index(PIO pio);
 void pio_select(PIO pio);
 PIO pio_get_current(void);
+
+void irq_set_handler(uint num, irq_handler_t handler, void *context);
+void irq_remove_handler(uint num, irq_handler_t handler);
+irq_handler_t irq_get_handler(uint num);
+void irq_set_enabled(uint num, bool enabled);
+bool irq_is_enabled(uint num);
 
 static inline void pio_error(PIO pio, const char *msg)
 {
@@ -886,6 +912,120 @@ static inline void gpio_pull_down(uint gpio) {
 
 static inline void gpio_disable_pulls(uint gpio) {
     gpio_set_pulls(gpio, false, false);
+}
+
+typedef enum pio_interrupt_source
+{
+    pis_sm0_rx_fifo_not_empty,
+    pis_sm1_rx_fifo_not_empty,
+    pis_sm2_rx_fifo_not_empty,
+    pis_sm3_rx_fifo_not_empty,
+    pis_sm0_tx_fifo_not_full,
+    pis_sm1_tx_fifo_not_full,
+    pis_sm2_tx_fifo_not_full,
+    pis_sm3_tx_fifo_not_full,
+    pis_interrupt0,
+    pis_interrupt1,
+    pis_interrupt2,
+    pis_interrupt3,
+
+    pis_max
+} pio_interrupt_source_t;
+
+uint pio_irq_map(PIO pio, uint irq_index);
+
+static inline int pio_get_irq_num(PIO pio, uint irqn) {
+    return pio->irq_base + pio_irq_map(pio, irqn);
+}
+
+static inline void irq_set_exclusive_handler(uint num, irq_handler_t handler)
+{
+    irq_set_handler(num, handler, 0);
+}
+
+static inline bool irq_has_handler(uint num)
+{
+    return !!irq_get_handler(num);
+}
+
+static inline bool irq_has_shared_handler(uint num)
+{
+    return !!irq_get_handler(num);
+}
+
+static inline irq_handler_t irq_get_exclusive_handler(uint num)
+{
+    return (void *)irq_get_handler(num);
+}
+
+static inline void pio_set_irqn_source_mask_enabled(PIO pio, uint irq_index,
+                                                    uint32_t source_mask, bool enabled)
+{
+    uint pirq = pio_irq_map(pio, irq_index);
+    pio->chip->set_irqn_source_mask_enabled(pio, pirq, source_mask, enabled);
+}
+
+static inline void pio_set_irq0_source_enabled(PIO pio, pio_interrupt_source_t source,
+                                               bool enabled)
+{
+    invalid_params_if(PIO, source >= pis_max);
+    pio_set_irqn_source_mask_enabled(pio, 0, 1 << source, enabled);
+}
+
+static inline void pio_set_irq1_source_enabled(PIO pio, pio_interrupt_source_t source,
+                                               bool enabled)
+{
+    invalid_params_if(PIO, source >= pis_max);
+    pio_set_irqn_source_mask_enabled(pio, 1, 1 << source, enabled);
+}
+
+static inline void pio_set_irq0_source_mask_enabled(PIO pio, uint32_t source_mask,
+                                                    bool enabled)
+{
+    pio_set_irqn_source_mask_enabled(pio, 0, source_mask, enabled);
+}
+
+static inline void pio_set_irq1_source_mask_enabled(PIO pio, uint32_t source_mask,
+                                                    bool enabled)
+{
+    pio_set_irqn_source_mask_enabled(pio, 1, source_mask, enabled);
+}
+
+static inline void pio_set_irqn_source_enabled(PIO pio, uint irq_index,
+                                               pio_interrupt_source_t source,
+                                               bool enabled)
+{
+    invalid_params_if(PIO, source >= pis_max);
+    pio_set_irqn_source_mask_enabled(pio, irq_index, 1 << source, enabled);
+}
+
+static inline bool pio_interrupt_get(PIO pio, uint pio_interrupt_num)
+{
+    check_pio_param(pio);
+    invalid_params_if(PIO, pio_interrupt_num >= 8);
+    return pio->chip->pio_interrupt_get(pio, pio_interrupt_num);
+}
+
+static inline void pio_interrupt_clear(PIO pio, uint pio_interrupt_num)
+{
+    check_pio_param(pio);
+    invalid_params_if(PIO, pio_interrupt_num >= 8);
+    pio->chip->pio_interrupt_clear(pio, pio_interrupt_num);
+}
+
+static inline pio_interrupt_source_t pio_get_tx_fifo_not_full_interrupt_source(uint sm)
+{
+    invalid_params_if(PIO, sm >= MAX_PIO_SMS);
+    return ((pio_interrupt_source_t)(pis_sm0_tx_fifo_not_full + sm));
+}
+
+static inline pio_interrupt_source_t pio_get_rx_fifo_not_empty_interrupt_source(uint sm) {
+    invalid_params_if(PIO, sm >= MAX_PIO_SMS);
+    return ((pio_interrupt_source_t)(pis_sm0_rx_fifo_not_empty + sm));
+}
+
+static inline uint pio_interrupt_rel(uint sm, uint pio_interrupt_num) {
+    return (pio_interrupt_num & 0x1c) | ((pio_interrupt_num + sm) & 0x3);
 }
 
 static inline void stdio_init_all(void)
