@@ -74,3 +74,8 @@ add_executable(irqhog irqhog.c)
 target_include_directories(irqhog PRIVATE ../include)
 target_link_libraries(irqhog pio)
 install(TARGETS irqhog RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+add_executable(irqtest2 irqtest2.c)
+target_include_directories(irqtest2 PRIVATE ../include ../../pinctrl)
+target_link_libraries(irqtest2 pio gpiolib)
+install(TARGETS irqtest2 RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
