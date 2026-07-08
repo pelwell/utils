@@ -15,8 +15,12 @@
 const char *program_name = "pinctrl";
 
 static int pin_mode = 0;
+static int pretty_mode = 0;
 static int verbose_mode = 0;
 static unsigned num_gpios;
+
+#define PRETTY_CELL_MAX 32
+#define PRETTY_CELL_WIDTH_MAX 24
 
 struct poll_gpio_state {
     unsigned int num;
@@ -72,7 +76,7 @@ static void usage(void)
     printf("%s must be run as root (or as a member of group 'gpio'\n", name);
     printf("on RPiOS).\n");
     printf("Use:\n");
-    printf("  %s [-p] [-v] get [GPIO]\n", name);
+    printf("  %s [-p] [-P] [-v] get [GPIO]\n", name);
     printf("OR\n");
     printf("  %s [-p] [-v] [-e] set <GPIO> [options]\n", name);
     printf("OR\n");
@@ -91,8 +95,11 @@ static void usage(void)
     printf("\n");
     printf("Note that omitting [GPIO] from \"%s get\" prints all GPIOs.\n", name);
     printf("If the -p option is given, GPIO numbers are replaced by pin numbers on the\n");
-    printf("40-way header. If the -v option is given, the output is more verbose. Including\n");
-    printf("the -e option in a \"set\" causes pinctrl to echo back the new pin states.\n");
+    printf("40-way header. The -P option is like -p, but for \"get\" with no GPIO given it\n");
+    printf("draws the whole header as ASCII art, laid out as it appears on the board, so\n");
+    printf("the physical position of each pin is obvious.\n");
+    printf("If the -v option is given, the output is more verbose. Including the\n");
+    printf("-e option in a \"set\" causes pinctrl to echo back the new pin states.\n");
     printf("%s funcs will dump all the possible GPIO alt functions in CSV format\n", name);
     printf("or if [GPIO] is specified the alternate funcs just for that specific GPIO.\n");
     printf("The -c option allows the alt functions (and only the alt function) for a named\n");
@@ -174,6 +181,111 @@ static int do_gpio_get(unsigned int gpio)
            gpio_get_gpio_fsel_name(gpio, fsel));
 
     return 0;
+}
+
+/*
+ * reversed selects field order: normal is "name fsel pull level" (for the
+ * right-hand/even-pin column, read outward from the pin number); reversed
+ * is "level pull fsel name" (for the left-hand/odd-pin column), so that
+ * once the left column is right-justified against the pin number, the two
+ * columns are a mirror image of each other about the header's centre line.
+ */
+static void format_pretty_cell(char *buf, size_t buflen, unsigned pin, int reversed)
+{
+    unsigned gpio = gpio_for_pin(pin);
+    const char *name;
+    const char *fsel_name, *pull_name, *level_name;
+    int fsel, level;
+
+    switch (gpio)
+    {
+    case GPIO_INVALID:
+    case GPIO_GND:
+    case GPIO_5V:
+    case GPIO_3V3:
+    case GPIO_1V8:
+    case GPIO_OTHER:
+        snprintf(buf, buflen, "%s", gpio_get_name(gpio));
+        return;
+    }
+
+    if (!gpio_num_is_valid(gpio))
+    {
+        snprintf(buf, buflen, "-");
+        return;
+    }
+
+    name = gpio_get_name(gpio);
+    if (strchr(name, '/'))
+        name = strchr(name, '/') + 1;
+
+    fsel = gpio_get_fsel(gpio);
+    level = gpio_get_level(gpio);
+    fsel_name = gpio_get_fsel_name(fsel);
+    pull_name = gpio_get_pull_name(gpio_get_pull(gpio));
+    level_name = (level == 1) ? "hi" : (level == 0) ? "lo" : "--";
+
+    if (reversed)
+        snprintf(buf, buflen, "%s %s %s %6s", level_name, pull_name, fsel_name, name);
+    else
+        snprintf(buf, buflen, "%-6s %s %s %s", name, fsel_name, pull_name, level_name);
+}
+
+static void print_dashes(int n)
+{
+    while (n-- > 0)
+        putchar('-');
+}
+
+/*
+ * Draw the 40-way header as two columns of 20, matching the physical
+ * layout when the board is viewed from above. Pin 1 is marked with a
+ * square bracket, echoing the square pad, and Os are used to represent
+ * the mounting holes on the board - visual cues to the orientation.
+ */
+static void do_pretty_get(void)
+{
+    char cells[NUM_HDR_PINS + 1][PRETTY_CELL_MAX];
+    unsigned pin, width = 0;
+    unsigned row;
+    int content_len;
+
+    for (pin = 1; pin <= NUM_HDR_PINS; pin++)
+    {
+        unsigned len;
+        format_pretty_cell(cells[pin], sizeof(cells[pin]), pin, pin % 2 == 1);
+        len = (unsigned)strlen(cells[pin]);
+        if (len > width)
+            width = len;
+    }
+    if (width > PRETTY_CELL_WIDTH_MAX)
+        width = PRETTY_CELL_WIDTH_MAX;
+
+    /* " %*s %s-%s %-*s " -> 1 + width + 1 + 4 + 1 + 4 + 1 + width + 1 */
+    content_len = 2 * (int)width + 13;
+
+    print_dashes(content_len);
+    printf(".\n");
+
+    printf("%-*sO |\n", content_len - 2, " ");
+    for (row = 1; row <= NUM_HDR_PINS / 2; row++)
+    {
+        unsigned lp = row * 2 - 1;
+        unsigned rp = row * 2;
+        char lmark[8], rmark[8];
+
+        if (lp == 1)
+            snprintf(lmark, sizeof(lmark), "[%2u]", lp);
+        else
+            snprintf(lmark, sizeof(lmark), "(%2u)", lp);
+        snprintf(rmark, sizeof(rmark), "(%2u)", rp);
+
+        printf(" %*s %s-%s %-*s |\n",
+               (int)width, cells[lp], lmark, rmark,
+               (int)width, cells[rp]);
+    }
+
+    printf("%-*sO |\n", content_len - 2, " ");
 }
 
 static int do_gpio_set(unsigned int gpio, int fsparam, int drive, int pull)
@@ -343,6 +455,7 @@ int main(int argc, char *argv[])
     int poll = 0;
     int funcs = 0;
     int echo = 0;
+    int explicit_gpio_selection = 0;
     int list = 0;
     int pull = PULL_MAX;
     int infer_cmd = 0;
@@ -388,6 +501,11 @@ int main(int argc, char *argv[])
         else if (strcmp(arg, "-p") == 0)
         {
             pin_mode = 1;
+        }
+        else if (strcmp(arg, "-P") == 0)
+        {
+            pin_mode = 1;
+            pretty_mode = 1;
         }
         else if (strcmp(arg, "-v") == 0)
         {
@@ -466,6 +584,7 @@ int main(int argc, char *argv[])
        {
            printf("No PIN numbers declared in DT - pin mode disabled\n");
            pin_mode = 0;
+           pretty_mode = 0;
        }
     }
 
@@ -479,6 +598,7 @@ int main(int argc, char *argv[])
     {
         char *p = *(argv++);
         argc--;
+        explicit_gpio_selection = 1;
 
         while (p)
         {
@@ -612,6 +732,20 @@ int main(int argc, char *argv[])
             get = 1;
     }
 
+    if (pretty_mode)
+    {
+        if (!get)
+        {
+            printf("The -P option is only supported with the \"get\" command\n");
+            return 1;
+        }
+        if (explicit_gpio_selection)
+        {
+            printf("The -P option shows the whole header and does not accept a GPIO/pin list\n");
+            return 1;
+        }
+    }
+
     /* parse remaining args */
     while (argc)
     {
@@ -682,7 +816,12 @@ int main(int argc, char *argv[])
         }
     }
 
-    for (pin = start_pin; pin < end_pin + 1; pin++)
+    if (pretty_mode)
+    {
+        do_pretty_get();
+    }
+
+    for (pin = start_pin; pin < end_pin + 1 && !pretty_mode; pin++)
     {
         if (!(gpiomask[pin / 32] & (1 << (pin % 32))))
             continue;

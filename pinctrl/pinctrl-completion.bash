@@ -11,7 +11,7 @@ _pinctrl ()
             chip=${COMP_WORDS[$((i + 1))]}
             i=$((i + 2))
         else
-            if [[ "$arg" == "-p" ]]; then
+            if [[ "$arg" == "-p" || "$arg" == "-P" ]]; then
                 pinmode=true
             fi
             i=$((i + 1))
@@ -70,7 +70,7 @@ _pinctrl ()
             chips="${CHIPS[@]}"
             COMPREPLY+=($(compgen -W "$chips" -- $cur))
         elif [[ "$cur" =~ ^- ]]; then
-            COMPREPLY+=($(compgen -W "-p -h -v -c" -- $cur))
+            COMPREPLY+=($(compgen -W "-p -P -h -v -c" -- $cur))
         elif [[ "$chip" == "" ]]; then
             COMPREPLY+=($(compgen -W "get set poll funcs help" -- $cur))
         else
