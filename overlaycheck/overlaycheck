@@ -840,7 +840,10 @@ sub get_params
                 {
                     error("Invalid overlay compatible string '$comp' in '$file'");
                 }
-                $props->{$1} = 1;
+                else
+                {
+                    $props->{$1} = 1;
+                }
             }
         }
         elsif ($line =~ /^\s+(?:__symbols__|__fixups__|__local_fixups__)/)
