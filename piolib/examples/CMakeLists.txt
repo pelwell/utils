@@ -54,3 +54,8 @@ add_executable(quadenc quadrature_encoder.c)
 target_include_directories(quadenc PRIVATE ../include)
 target_link_libraries(quadenc pio)
 install(TARGETS quadenc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+add_executable(txcount txcount.c)
+target_include_directories(txcount PRIVATE ../include)
+target_link_libraries(txcount pio)
+install(TARGETS txcount RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
