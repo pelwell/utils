@@ -79,3 +79,8 @@ add_executable(irqtest2 irqtest2.c)
 target_include_directories(irqtest2 PRIVATE ../include ../../pinctrl)
 target_link_libraries(irqtest2 pio gpiolib)
 install(TARGETS irqtest2 RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+add_executable(txsink txsink.c)
+target_include_directories(txsink PRIVATE ../include)
+target_link_libraries(txsink pio)
+install(TARGETS txsink RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
