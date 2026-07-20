@@ -59,3 +59,8 @@ add_executable(txcount txcount.c)
 target_include_directories(txcount PRIVATE ../include)
 target_link_libraries(txcount pio)
 install(TARGETS txcount RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+add_executable(blockingtest blockingtest.c)
+target_include_directories(blockingtest PRIVATE ../include)
+target_link_libraries(blockingtest pio pthread)
+install(TARGETS blockingtest RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
