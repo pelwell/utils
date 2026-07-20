@@ -388,7 +388,8 @@ static void rp1_pio_sm_exec(PIO pio, uint sm, uint instr, bool blocking)
     struct rp1_pio_sm_exec_args args = { .sm = sm, .instr = instr, .blocking = blocking };
 
     check_sm_param(sm);
-    (void)rp1_ioctl(pio, PIO_IOC_SM_EXEC, &args);
+    if (rp1_ioctl(pio, PIO_IOC_SM_EXEC, &args) < 0)
+        pio_panic("Failed to exec PIO instruction");
 }
 
 static void rp1_pio_sm_clear_fifos(PIO pio, uint sm)
@@ -523,7 +524,8 @@ static void rp1_pio_sm_put(PIO pio, uint sm, uint32_t data, bool blocking)
     struct rp1_pio_sm_put_args args = { .sm = (uint16_t)sm, .blocking = blocking, .data = data };
 
     check_sm_param(sm);
-    (void)rp1_ioctl(pio, PIO_IOC_SM_PUT, &args);
+    if (rp1_ioctl(pio, PIO_IOC_SM_PUT, &args) < 0)
+        pio_panic("Failed to put PIO FIFO data");
 }
 
 static uint32_t rp1_pio_sm_get(PIO pio, uint sm, bool blocking)
@@ -531,7 +533,8 @@ static uint32_t rp1_pio_sm_get(PIO pio, uint sm, bool blocking)
     struct rp1_pio_sm_get_args args = { .sm = (uint16_t)sm, .blocking = blocking };
 
     check_sm_param(sm);
-    (void)rp1_ioctl(pio, PIO_IOC_SM_GET, &args);
+    if (rp1_ioctl(pio, PIO_IOC_SM_GET, &args) < 0)
+        pio_panic("Failed to get PIO FIFO data");
     return args.data;
 }
 
