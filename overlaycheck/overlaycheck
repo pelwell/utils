@@ -1,14 +1,745 @@
-#!/usr/bin/env perl
+#!/usr/bin/env python3
 
-use strict;
-use warnings;
-use File::Temp qw/ tempdir /;
+# Successor to the Perl 'overlaycheck'. Validates the overlay .dts files,
+# README, and Makefile in a kernel tree, the same way the Perl tool did,
+# but structural DT checks (dormant fragments, gpio/pinctrl wiring,
+# container-overlay parameter targets, override parameter extraction) work
+# by walking a parsed tree in-process (ovmerge_engine) instead of shelling
+# out to dtc/ovmerge and regexing their serialized text output. Real
+# compilation (cpp+dtc to .dtb/.dtbo) and the final base+overlay merge
+# validity check (dtmerge) still run as external tools - those exercise
+# the real toolchain, which isn't something to reimplement.
+#
+# Deliberately kept as a single file (plus the shared ovmerge_engine.py,
+# reused from the ovmerge tool) rather than split further, so installing
+# this script is just "copy one file" - see _search_dirs()/_find_file()
+# below for where it expects to find ovmerge_engine.py.
 
-my $DTMERGE = "dtmerge";
-my $TMPDIR = tempdir( CLEANUP => 1);
-my $MERGED_DTB = "$TMPDIR/merged.dtb";
+import glob
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
 
-my @base_files = (
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _search_dirs():
+    """Places ovmerge_engine.py / the ovmerge CLI might live, in priority
+    order: next to this script (the two tools installed side by side into
+    one bin directory), the development-tree sibling layout (this script
+    under overlaycheck/, ovmerge under ../ovmerge/), then anywhere on
+    PATH (installed separately from this script but still reachable -
+    including a future 'ovmerge' with no '.py' suffix)."""
+    dirs = [_HERE, os.path.normpath(os.path.join(_HERE, '..', 'ovmerge'))]
+    dirs += [d for d in os.environ.get('PATH', '').split(os.pathsep) if d]
+    seen = set()
+    for d in dirs:
+        d = os.path.abspath(d)
+        if d not in seen:
+            seen.add(d)
+            yield d
+
+
+def _find_file(names):
+    """Full path to the first of names found across _search_dirs(), or None."""
+    for d in _search_dirs():
+        for name in names:
+            path = os.path.join(d, name)
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+_engine_file = _find_file(['ovmerge_engine.py'])
+if _engine_file:
+    sys.path.insert(0, os.path.dirname(_engine_file))
+
+try:
+    from ovmerge_engine import (  # noqa: E402
+        NAME, OvMergeError, dtparam, dtparse, find_wakeable_fragments,
+        get_child, get_children, get_label_ref, get_labels,
+        get_node, get_prop, get_props, get_prop_string, node_path, ovapply1,
+        ovapply2,
+    )
+except ImportError:
+    fatal_msg = (
+        "Can't find ovmerge_engine.py. Install it next to this script, in a "
+        "sibling '../ovmerge' directory, or anywhere on PATH."
+    )
+    print(f"* {fatal_msg}")
+    sys.exit(1)
+
+# The 'ovmerge' CLI (currently ovmerge.py, eventually just 'ovmerge') is only
+# needed for the '// redo:' regeneration check - not for the import above.
+OVMERGE_PY = _find_file(['ovmerge', 'ovmerge.py'])
+DTMERGE = 'dtmerge'
+
+
+# Diagnostics
+# ---------------------------------------------------------------------------
+# Accumulator for overlaycheck2, replacing the Perl tool's global $fail flag
+# plus ad hoc error()/print() calls.
+
+class Reporter:
+    def __init__(self):
+        self.fail = False
+        self.context = None
+
+    def _emit(self, msg):
+        if self.context:
+            print(f"* {self.context}: {msg}")
+        else:
+            print(f"* {msg}")
+
+    def error(self, msg):
+        self._emit(msg)
+        self.fail = True
+
+    def warn(self, msg):
+        self._emit(msg)
+
+
+# Text-format parsers
+# ---------------------------------------------------------------------------
+# Parsers for the plain-text formats overlaycheck cross-references against
+# the Device Tree source: the overlays README, the overlays Makefile, and
+# the local exclusions file. These aren't tree-shaped, so they stay simple
+# line-oriented parsers (near-verbatim ports of the Perl tool's
+# parse_readme/parse_makefile/parse_exclusions), just taking a Reporter
+# instead of a global $fail flag.
+
+WORD_PATTERN = r'[0-9a-zA-Z0-9][-_a-zA-Z0-9]*'
+README_PARAM_PATTERN = r'([-_a-zA-Z0-9]|<[a-z]>|<[a-z]-[a-z]>)*'
+
+_DESCR_COLUMN = 32
+
+
+def parse_exclusions(path, reporter):
+    """Returns (ignore_missing, ignore_vestigial): overlay name -> list of
+    parameter names to exclude from the 'undocumented'/'vestigial' checks."""
+    ignore_missing = {}
+    ignore_vestigial = {}
+
+    try:
+        fh = open(path)
+    except OSError:
+        reporter.error(f"Failed to open '{path}'")
+        return ignore_missing, ignore_vestigial
+
+    overlay = None
+    with fh:
+        for line in fh:
+            line = line.rstrip('\n')
+
+            m = re.match(r'^=\s*(.+)$', line)
+            if m:
+                overlay = m.group(1)
+                ignore_missing[overlay] = []
+                ignore_vestigial[overlay] = []
+                continue
+
+            m = re.match(r'^-\s*(.+)$', line)
+            if m:
+                ignore_missing[overlay].append(m.group(1))
+                continue
+
+            m = re.match(r'^\+\s*(.+)$', line)
+            if m:
+                ignore_vestigial[overlay].append(m.group(1))
+                continue
+
+    return ignore_missing, ignore_vestigial
+
+
+def parse_readme(path, ignore_missing, ignore_vestigial, documentation, reporter):
+    """Parses the overlays README into {overlay_name: [param, ...]}.
+
+    ignore_missing/ignore_vestigial/documentation are dicts (as returned by
+    parse_exclusions for the first two) that get further entries added for
+    '<Deprecated>' and '<Documentation>' pseudo-overlays, matching the
+    original tool's behaviour of sharing these across both parsers.
+    """
+    overlays = {}
+
+    try:
+        fh = open(path)
+    except OSError:
+        reporter.error(f"Failed to open '{path}'")
+        return overlays
+
+    overlay = None
+    last_overlay = ''
+    params = None
+    has_params = False
+    in_params = False
+    blank_count = 0
+    linenum = 0
+
+    with fh:
+        for line in fh:
+            linenum += 1
+            line = line.rstrip('\n')
+
+            if '\t' in line:
+                reporter.error(f"TABs in README ({linenum})")
+            if re.search(r'\s$', line):
+                reporter.error(f"Trailing whitespace in README ({linenum})")
+            if len(line) > 80 and not re.match(r'^\s*[^\s]+$', line):
+                reporter.error(f"Line too long in README ({linenum})")
+
+            if overlay and not line:
+                blank_count += 1
+                if blank_count == 2:
+                    if params is None:
+                        reporter.error(f"Missing params for overlay {overlay} ({linenum})")
+                    if isinstance(params, list):
+                        overlays[overlay] = sorted(params)
+                    elif params:
+                        overlays[overlay] = params
+                    else:
+                        overlays[overlay] = []
+
+                    overlay = None
+                    params = None
+                    in_params = False
+                continue
+
+            blank_count = 0
+
+            if re.match(r'^\w+:\s', line) and not re.match(r'^(Name|Info|Load|Params):', line):
+                reporter.error(f"Bad label ({linenum})")
+
+            m = re.match(r'^Name:(\s*)(.*)\s*$', line)
+            if m:
+                if m.group(1) != '   ':
+                    reporter.error(f"Bad formatting in README ({linenum})")
+                if params is not None:
+                    reporter.error(f"Missing blank lines after overlay? ({linenum})")
+                overlay = m.group(2)
+                params = None
+                in_params = False
+                if not re.match(rf'^{WORD_PATTERN}$', overlay) and overlay != '<The base DTB>':
+                    reporter.error(f"Illegal overlay name '{overlay}' in README ({linenum})")
+
+                if not (overlay > last_overlay):
+                    reporter.error(f"Overlay '{overlay}' - order violation in README ({linenum})")
+                last_overlay = overlay if overlay != '<The base DTB>' else ' '
+                continue
+
+            m = re.match(r'^Info:(\s*)(.*)\s*$', line)
+            if m:
+                if m.group(1) != '   ':
+                    reporter.error(f"Bad formatting in README ({linenum})")
+                if not overlay:
+                    reporter.error(f"Info label with no Name? ({linenum})")
+                mm = re.match(rf'^See ({WORD_PATTERN})(?:\s+\(.*)?$', m.group(2))
+                if mm:
+                    params = mm.group(1)
+                continue
+
+            m = re.match(r'^Load:(\s*)(.*)\s*$', line)
+            if m:
+                if m.group(1) != '   ':
+                    reporter.error(f"Bad formatting in README ({linenum})")
+                if not overlay:
+                    reporter.error(f"Load label with no Name? ({linenum})")
+                cmd = m.group(2)
+                has_params = False
+                if overlay != '<The base DTB>':
+                    if cmd == '<Deprecated>':
+                        # Ignore this overlay
+                        ignore_missing[overlay] = True
+                        ignore_vestigial[overlay] = True
+                        overlay = None
+                    elif cmd == '<Documentation>':
+                        # Not a real overlay - a placeholder for common documentation
+                        documentation[overlay] = True
+                        ignore_missing[overlay] = True
+                        ignore_vestigial[overlay] = True
+                        has_params = True
+                    else:
+                        mm = re.match(
+                            rf'^dtoverlay=({WORD_PATTERN})(,<param>(?:=<val>|\[=<val>\])?)?$', cmd)
+                        if not mm:
+                            reporter.error(f"Invalid Load example ({linenum})")
+                        elif mm.group(1) != overlay:
+                            reporter.error(f"Wrong overlay name in Load example ({linenum})")
+                        if mm and mm.group(2):
+                            has_params = True
+                continue
+
+            m = re.match(r'^Params:(.*)$', line) if overlay is not None else None
+            if m:
+                blank_count = 0
+                rol = m.group(1)
+                params = []
+                in_params = True
+
+                if rol:
+                    if rol == ' <None>':
+                        if has_params:
+                            reporter.error(f"Parameter presence mismatch ({linenum})")
+                        continue
+                    mm = re.match(r'^ ([^ ]+)( *)', rol)
+                    if not mm:
+                        reporter.error(f"Bad formatting in README ({linenum})")
+                        continue
+                    if not has_params:
+                        reporter.error(f"Parameter presence mismatch ({linenum})")
+                    param, indent2 = mm.group(1), len(mm.group(2))
+                    if not re.fullmatch(README_PARAM_PATTERN, param):
+                        reporter.error(f"Invalid parameter name '{param}' in README ({linenum})")
+                    descr_indent = 8 + len(param) + indent2
+                    if descr_indent != _DESCR_COLUMN and indent2 != 0:
+                        reporter.error(f"Bad formatting in README ({linenum})")
+                    params.append(param)
+                continue
+
+            m = re.match(r'^( +)([^ ]+)( *)', line) if in_params else None
+            if m:
+                indent, param, indent2 = len(m.group(1)), m.group(2), len(m.group(3))
+                if indent == 8:
+                    descr_indent = 8 + len(param) + indent2
+                    # Try to spot a comment
+                    if ((indent2 == 1 or (indent2 == 0 and param.endswith(':'))) and
+                            descr_indent < _DESCR_COLUMN):
+                        in_params = False
+                        continue
+                    if not re.fullmatch(README_PARAM_PATTERN, param):
+                        reporter.error(f"Invalid parameter name '{param}' in README ({linenum})")
+                    if descr_indent != _DESCR_COLUMN and indent2 != 0:
+                        reporter.error(f"Bad formatting in README ({linenum})")
+                    params.append(param)
+                else:
+                    if indent < 8 or (indent > 8 and indent < _DESCR_COLUMN):
+                        reporter.error(f"Bad formatting in README ({linenum})")
+
+    # Resolve inter-overlay ("See") references
+    for name in list(overlays.keys()):
+        src = overlays[name]
+        if not isinstance(src, list):
+            resolved = overlays.get(src)
+            if isinstance(resolved, list):
+                overlays[name] = resolved
+            else:
+                reporter.error(f"Chained 'See' link from {name} to {src}")
+
+    return overlays
+
+
+def parse_makefile(path, reporter):
+    """Returns the ordered list of overlay names built by the Makefile,
+    with '<The base DTB>' prepended (matching the source-file set's
+    convention for the always-present base DTB entry)."""
+    overlays = ['<The base DTB>']
+
+    try:
+        fh = open(path)
+    except OSError:
+        reporter.error(f"Failed to open '{path}'")
+        return overlays
+
+    last_overlay = ''
+    linenum = 0
+    in_multiline = False
+
+    with fh:
+        for line in fh:
+            linenum += 1
+            line = line.rstrip('\n')
+            if re.search(r'\s$', line):
+                reporter.error(f"Trailing whitespace in Makefile ({linenum})")
+            overlay = None
+
+            if in_multiline:
+                m = re.match(r'^\t(.+)\.dtbo( \\)?$', line)
+                if m:
+                    overlay = m.group(1)
+                    if not m.group(2):
+                        in_multiline = False
+                else:
+                    reporter.error(f"Syntax error in Makefile ({linenum})")
+            else:
+                m = re.match(r'^dtbo-\$\(RPI_DT_OVERLAYS\) \+= (.+)\.dtbo$', line)
+                if m:
+                    overlay = m.group(1)
+                elif re.match(r'^dtbo-\$\(CONFIG_ARCH_BCM2835\) \+= \\$', line):
+                    in_multiline = True
+
+            if overlay:
+                if not (overlay > last_overlay):
+                    reporter.error(f"Overlay '{overlay}' - order violation in Makefile ({linenum})")
+                overlays.append(overlay)
+                last_overlay = overlay
+
+    return overlays
+
+
+# Checker registration and dispatch
+# ---------------------------------------------------------------------------
+# A "checker" is a Checker subclass, one fresh instance of which is created
+# for every tree walk - replacing the old approach of shelling out to
+# dtc/ovmerge and regexing their serialized text output line-by-line.
+#
+# Instantiating fresh per walk means a checker's own attributes are already
+# per-overlay state, there from on_node() to on_end() and gone again on the
+# next overlay's walk - no need to stash anything on the shared CheckContext.
+
+_CHECKER_CLASSES = []
+
+
+class Checker:
+    """Base class for a checker. Subclass it and set exactly one of `path`
+    or `name` (regex strings, anchored with .match() - use '$' to anchor the
+    end too) to have on_node() called for every node whose full path / own
+    name matches; the regex Match object is passed in, so capture groups
+    (e.g. a fragment number) are available without re-deriving them. Leave
+    both unset to skip per-node dispatch entirely.
+
+    on_end() is called once per walk, after every node has been visited
+    (and after any on_node() calls) - for checks that need to see the whole
+    tree, or to report on state on_node() accumulated across matching nodes.
+    Override either or both of on_node()/on_end(); the defaults do nothing.
+
+    Subclasses are auto-registered and instantiated fresh (no constructor
+    arguments) for each call to walk()."""
+
+    path = None
+    name = None
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if cls.path is not None and cls.name is not None:
+            raise ValueError(f"{cls.__name__}: set at most one of path/name")
+        cls._pattern = re.compile(cls.path if cls.path is not None else cls.name) \
+            if (cls.path is not None or cls.name is not None) else None
+        cls._on_path = cls.path is not None
+        _CHECKER_CLASSES.append(cls)
+
+    def on_node(self, node, ctx, m):
+        pass
+
+    def on_end(self, ctx):
+        pass
+
+
+class CheckContext:
+    """Passed to every checker: the parsed DT, which overlay/file it came
+    from, and the shared Reporter for surfacing errors/warnings."""
+
+    def __init__(self, dt, overlay_name, source_file, reporter):
+        self.dt = dt
+        self.overlay_name = overlay_name
+        self.source_file = source_file
+        self.reporter = reporter
+
+
+def walk(root, ctx):
+    """Visit every node in the tree rooted at root, dispatching to every
+    registered checker (a fresh instance per call) whose pattern matches,
+    then let each checker report via on_end()."""
+    instances = [cls() for cls in _CHECKER_CLASSES]
+
+    def visit(node):
+        path = None
+        for inst in instances:
+            pattern = inst._pattern
+            if pattern is None:
+                continue
+            if inst._on_path:
+                if path is None:
+                    path = node_path(node)
+                m = pattern.match(path)
+            else:
+                m = pattern.match(node[NAME])
+            if m:
+                inst.on_node(node, ctx, m)
+        for child in get_children(node):
+            visit(child)
+
+    visit(root)
+
+    for inst in instances:
+        inst.on_end(ctx)
+
+
+# Override-parameter / platform extraction
+# ---------------------------------------------------------------------------
+# Extracts the information the old Perl tool's get_params() scraped from
+# dtc's pretty-printed '-O dts' text output (override parameter names, and
+# which platform an overlay's 'compatible' string declares) - reading it
+# directly from the parsed tree instead.
+#
+# Note: the old get_params() also had a 'deadbeef' placeholder-value check
+# that only made sense because it was scanning dtc's re-serialized text;
+# with no text-scraping step to protect against, there's nothing for it to
+# guard here, so it's intentionally not carried over.
+
+_PLATFORM_RE = re.compile(r'^brcm,(bcm2835|bcm2711|bcm2712)$')
+
+
+class SourceInfo:
+    """What overlaycheck needs from one parsed base/overlay .dts file: its
+    __overrides__ parameter names, and (for overlays) which platform(s) its
+    'compatible' string declares support for."""
+
+    def __init__(self, params, platforms):
+        self.params = params
+        self.platforms = platforms
+
+
+def get_source_info(dt, source_file, reporter, is_overlay):
+    overrides = get_node(dt, '/__overrides__')
+    params = []
+    for prop in (get_props(overrides) if overrides is not None else []):
+        name = prop[0]
+        if not re.fullmatch(WORD_PATTERN, name):
+            reporter.error(f"Invalid parameter name '{name}' in '{source_file}'")
+        params.append(name)
+    params.sort()
+
+    platforms = set()
+    if is_overlay:
+        compat = get_prop_string(dt.root, 'compatible')
+        if compat is None:
+            reporter.error(f"Missing overlay compatible string in '{source_file}'")
+        else:
+            m = _PLATFORM_RE.match(compat)
+            if not m:
+                reporter.error(f"Invalid overlay compatible string '{compat}' in '{source_file}'")
+            else:
+                platforms.add(m.group(1))
+
+    return SourceInfo(params, platforms)
+
+
+# GPIO/pinctrl checks
+# ---------------------------------------------------------------------------
+# Checks around GPIO-hog/pinctrl fragments in an overlay:
+#  A) a child node of a fragment targeting the literal 'gpio' label, that
+#     isn't a gpio-hog, must have a label (otherwise nothing can reference it)
+#  B) every such label must actually be referenced by some 'pinctrl-0'
+#     property or override declaration
+#  C) an __overrides__ declaration must not target a fragment's own label
+#     (only its 'target'/'target-path' properties are legitimate to retarget)
+#
+# Replaces the old pinctrl_checker(), which tracked fragment/node/brace
+# depth by hand while reading 'ovmerge -N' text output line by line.
+# Unlike that version, this checks every direct child of a matching
+# fragment's payload (the old brace-depth tracker gave up on the rest of a
+# fragment's siblings after the first child that didn't match its
+# line-oriented pattern - e.g. any property appearing before a subnode, or a
+# subnode name containing '@'); this is intentionally more thorough.
+#
+# One deliberate behaviour change found while testing this against real
+# overlays: a labelled gpio-hog node no longer counts as needing a
+# pinctrl-0 reference. The old check's line-oriented pattern also excluded
+# '@'-addressed node names, which happened to hide this - a labelled hog
+# node with a unit address (e.g. "hog: hog@1a { gpio-hog; ... };", used so
+# an __overrides__ declaration can address it) was never actually reached by
+# the old checker. Once every child is checked, the old rule as literally
+# written would flag every such hog as an unreferenced pinctrl label, which
+# is wrong: a hog self-activates and was never meant to need one.
+
+_GPIO_LABEL = '&gpio'
+
+
+def _collect_pinctrl_refs(dt):
+    refs = set()
+
+    def walk_refs(node):
+        prop = get_prop(node, 'pinctrl-0')
+        if prop is not None:
+            for chunk in prop[1:]:
+                if chunk[0] == '<':
+                    for elem in chunk[2]:
+                        if isinstance(elem, str) and elem.startswith('&'):
+                            refs.add(elem[1:])
+        for child in get_children(node):
+            walk_refs(child)
+
+    walk_refs(dt.root)
+
+    overrides = get_node(dt, '/__overrides__')
+    for prop in (get_props(overrides) if overrides is not None else []):
+        dtparam(dt, prop[0], None, pinctrl_refs=refs)
+
+    return refs
+
+
+def _collect_misused_fragment_labels(dt, fraglabels):
+    misused = []
+    seen = set()
+
+    def on_label_use(label, prop):
+        if label in fraglabels and not prop.startswith('target') and label not in seen:
+            misused.append(label)
+            seen.add(label)
+
+    overrides = get_node(dt, '/__overrides__')
+    for prop in (get_props(overrides) if overrides is not None else []):
+        dtparam(dt, prop[0], None, label_use=on_label_use)
+
+    return misused
+
+
+class CheckPinctrl(Checker):
+    """Visits every fragment, tallying its label plus (for one targeting the
+    literal 'gpio' label) its unlabelled/labelled-non-hog children; reports
+    on the complete tallies once the whole tree has been seen."""
+
+    name = r'^fragment[@-](\d+)$'
+
+    def __init__(self):
+        self.fraglabels = set()
+        self.gpio_labels = set()
+        self.unlabelled_nodes = []
+
+    def on_node(self, node, ctx, m):
+        self.fraglabels.update(get_labels(node))
+
+        target = get_prop(node, 'target')
+        if target is None:
+            return
+        if get_label_ref(target[1]) != _GPIO_LABEL:
+            return
+
+        payload = get_child(node, '__overlay__') or get_child(node, '__dormant__')
+        if payload is None:
+            return
+
+        for sub in get_children(payload):
+            is_hog = get_prop(sub, 'gpio-hog') is not None
+            labels = get_labels(sub)
+            if labels:
+                if not is_hog:
+                    self.gpio_labels.update(labels)
+            elif not is_hog:
+                self.unlabelled_nodes.append(sub[NAME])
+
+    def on_end(self, ctx):
+        pinctrl_refs = _collect_pinctrl_refs(ctx.dt)
+
+        for name in sorted(self.unlabelled_nodes):
+            ctx.reporter.error(f"gpio node {name} has no label")
+
+        for label in sorted(self.gpio_labels):
+            if label not in pinctrl_refs:
+                ctx.reporter.error(f"gpio node label {label} is not referenced")
+
+        for label in _collect_misused_fragment_labels(ctx.dt, self.fraglabels):
+            ctx.reporter.error(f"misused fragment label {label}")
+
+
+# Container-overlay checks
+# ---------------------------------------------------------------------------
+# Checks that "container" overlays (i2c-rtc, i2c-fan, i2c-sensor: a menu of
+# optional devices selected via boolean __overrides__ params) actually wire
+# each parameter to the device node it's named after.
+#
+# Replaces the old container_checker(), which compiled the overlay to a
+# real .dtbo, ran 'fdtget -t bx' on each override to find the ones in the
+# fragment-toggle form (a raw byte match on the phandle cell being zero),
+# applied each one via the external 'dtmerge' binary, and grepped 'dtdiff'
+# text output for an added node. All of that is replaced by applying the
+# override and merging the fragment in-process (dtparam, then ovapply1 to
+# fold the newly-woken fragment into the local 'i2cbus' label these
+# overlays target - see i2c-buses.dtsi - before ovapply2 merges the result
+# onto a real base tree) and diffing node names directly, using the same
+# fragment-toggle-form test as find_wakeable_fragments() (the override's
+# first reference is the literal label '0', not a real node label).
+#
+# Only applies to CONTAINER_OVERLAYS, and needs ctx.info (the overlay's
+# SourceInfo, for its __overrides__ param names) and ctx.base0_dts_path (set
+# on the CheckContext before walking) - skipped like any other checker whose
+# match fails when neither is available.
+
+CONTAINER_OVERLAYS = ('i2c-rtc', 'i2c-fan', 'i2c-sensor')
+
+
+def _node_names(node, names):
+    names.add(node[NAME])
+    for child in get_children(node):
+        _node_names(child, names)
+
+
+class CheckContainer(Checker):
+    """Only applies to CONTAINER_OVERLAYS, and needs ctx.info (the overlay's
+    SourceInfo, for its __overrides__ param names) and ctx.base0_dts_path
+    (set on the CheckContext before walking) - skipped like any other
+    checker whose match fails when neither is available. Doesn't react to
+    individual nodes, so leaves on_node() unused and only does its work in
+    on_end()."""
+
+    def on_end(self, ctx):
+        if ctx.overlay_name not in CONTAINER_OVERLAYS or ctx.info is None or not ctx.base0_dts_path:
+            return
+
+        overlay_path = ctx.source_file
+        base_path = ctx.base0_dts_path
+        params = ctx.info.params
+        reporter = ctx.reporter
+
+        before = dtparse(base_path, False)
+        before_names = set()
+        _node_names(before.root, before_names)
+
+        for param in params:
+            ov = dtparse(overlay_path, False)
+            overrides = get_node(ov, '/__overrides__')
+            ovr = get_prop(overrides, param)
+            if ovr is None or len(ovr) < 2 or get_label_ref(ovr[1]) != '0':
+                continue
+
+            dtparam(ov, param, '')
+            ovapply1(ov)  # fold the newly-woken fragment into its (local) i2cbus label
+
+            base = dtparse(base_path, False)
+            try:
+                ovapply2(base, ov)
+            except OvMergeError as ex:
+                reporter.error(f"failed to merge with param '{param}': {ex}")
+                continue
+
+            after_names = set()
+            _node_names(base.root, after_names)
+            new_names = after_names - before_names
+
+            paramx = re.sub(r'\d$', 'x', param)
+            wanted = re.compile(rf'^({re.escape(param)}|{re.escape(paramx)})@')
+            if not any(wanted.match(name) for name in new_names):
+                reporter.error(f"parameter '{param}' doesn't enable matching node")
+
+
+# Dormant-fragment check
+# ---------------------------------------------------------------------------
+# Detects '__dormant__' fragment payloads that no __overrides__ declaration
+# can ever wake up. Replaces the old dormant_checker(), which tracked
+# fragment/__overrides__ structure by hand while reading 'ovmerge -N' text
+# output line by line.
+#
+# ctx.wakeable (a set of fragment-number strings, from
+# find_wakeable_fragments()) must be set on the CheckContext before walking
+# an overlay's tree with this checker registered.
+
+class CheckDormantFragment(Checker):
+    name = r'^fragment[@-](\d+)$'
+
+    def on_node(self, node, ctx, m):
+        if get_child(node, '__dormant__') is None:
+            return
+        num = m.group(1)
+        if num not in ctx.wakeable:
+            ctx.reporter.error(f"fragment {num} is dormant and cannot be activated")
+
+
+# Main
+# ---------------------------------------------------------------------------
+
+BASE_FILES = [
     "bcm2712-rpi-5-b",
     "bcm2712-rpi-cm5-cm5io",
     "bcm2711-rpi-4-b",
@@ -25,9 +756,9 @@ my @base_files = (
     "bcm2710-rpi-3-b-plus",
     "bcm2710-rpi-cm3",
     "bcm2710-rpi-zero-2-w",
-);
+]
 
-my @extra_base_files = (
+EXTRA_BASE_FILES = [
     "bcm2709-rpi-cm2",
     "bcm2710-rpi-cm0",
     "bcm2710-rpi-2-b",
@@ -36,1064 +767,400 @@ my @extra_base_files = (
     "bcm2712-rpi-cm5-cm4io",
     "bcm2712-rpi-cm5l-cm5io",
     "bcm2712-rpi-cm5l-cm4io",
-);
+]
 
-my %platform_reps = (
-    'bcm2835' => 'bcm2710-rpi-3-b',
-    'bcm2711' => 'bcm2711-rpi-4-b',
-    'bcm2712' => 'bcm2712-rpi-5-b',
-);
-
-$ENV{'LD_LIBRARY_PATH'} = "$ENV{'HOME'}/lib";
-
-my %overlay_checkers = (
-    # With the current overlays, the exclusions are no longer necessary, but an
-    # example for i2c-sensor would be:
-    #   '^(addr|lm75addr|int_pin|i2c\d|i2c_csi_dsi|no_timeout)$'
-    'i2c-rtc' => [ \&container_checker, undef ],
-    'i2c-fan' => [ \&container_checker, undef ],
-    'i2c-sensor' => [ \&container_checker, undef ],
-    );
-
-my $word_pattern = '[0-9a-zA-Z0-9][-_a-zA-Z0-9]*';
-my $readme_param_pattern = '([-_a-zA-Z0-9]|<[a-z]>|<[a-z]-[a-z]>)*';
-
-my $verbose;
-my $strict_dtc;
-my $try_all;
-my $fail = 0;
-
-while (@ARGV && $ARGV[0] =~ /^-/)
-{
-    my $arg = shift @ARGV;
-    if ($arg eq '-h')
-    {
-        usage();
-        exit(0);
-    }
-    elsif ($arg eq '-s')
-    {
-        $strict_dtc = 1;
-    }
-    elsif ($arg eq '-t')
-    {
-        $try_all = 1;
-    }
-    elsif ($arg eq '-v')
-    {
-        $verbose = 1;
-    }
-    else
-    {
-        fatal_error("Unknown option '$arg'");
-    }
+PLATFORM_REPS = {
+    'bcm2835': 'bcm2710-rpi-3-b',
+    'bcm2711': 'bcm2711-rpi-4-b',
+    'bcm2712': 'bcm2712-rpi-5-b',
 }
 
-my @overlays = @ARGV;
-
-# Aims:
-# * Check that each overlay has an entry in the README
-# * Check that the parameters of each overlay are in the README
-# * Check that the parameters of the base DTBs are in the README
-# * Check that each overlay has an entry in the Makefile
-
-# Process:
-# 1) Parse the base dts's and overlays
-# 2) Parse the README
-# 3) Compare the two
-# 4) Parse the Makefile, and compare with the others
-
-my $kerndir = `git rev-parse --show-toplevel 2>/dev/null`;
-chomp($kerndir);
-fatal_error("This isn't a Linux repository") if (!-d "$kerndir/kernel");
-
-# 32-bit first, to avoid the #include "arm/broadcom..." versions in the arm64 tree
-my $dtspath = (-f $kerndir."/arch/arm/boot/dts/broadcom/Makefile") ?
-        $kerndir."/arch/arm/boot/dts/broadcom" :
-        $kerndir."/arch/arm/boot/dts";
-
-my $dts64path = (-f $kerndir."/arch/arm64/boot/dts/broadcom/Makefile") ?
-        $kerndir."/arch/arm64/boot/dts/broadcom" :
-        $kerndir."/arch/arm64/boot/dts";
-
-my (@base32_files, @base64_files, @extra_base32_files, @extra_base64_files);
-
-foreach my $base (@base_files)
-{
-        if (-f $dtspath."/".$base.".dts")
-        {
-                push @base32_files, $base;
-        }
-        elsif (-f $dts64path."/".$base.".dts")
-        {
-                push @base64_files, $base;
-        }
-}
-
-foreach my $base (@extra_base_files)
-{
-        if (-f $dtspath."/".$base.".dts")
-        {
-                push @extra_base32_files, $base;
-        }
-        elsif (-f $dts64path."/".$base.".dts")
-        {
-                push @extra_base64_files, $base;
-        }
-}
-
-my @dtsgroups = (
-        [ $dts64path, \@base64_files ],
-        [ $dtspath, \@base32_files ],
-);
-
-my @extra_dtsgroups = (
-        [ $dts64path, \@extra_base64_files ],
-        [ $dtspath, \@extra_base32_files ],
-);
-
-my $overlaysdir = $kerndir."/arch/arm/boot/dts/overlays";
-my @cpp_files = ('arm-linux-gnueabihf-cpp', 'aarch64-linux-gnu-cpp', 'cpp');
-my $cpp;
-foreach my $cmd (@cpp_files) {
-    if (system("command -v $cmd >/dev/null 2>&1") == 0) {
-        $cpp = $cmd;
-        last;
-    }
-}
-die "* no suitable cpp found\n" if (!$cpp);
-
-my @cpp_cmd =
-    (
-        $cpp,
-        '-nostdinc',
-        '-I.',
-        "-I$kerndir/include",
-        '-Ioverlays',
-        '-undef',
-        '-D__DTS__',
-        '-x',
-        'assembler-with-cpp'
-    );
-
-my $DTC = "$kerndir/scripts/dtc/dtc";
-my $exclusions_file = $0 . "_exclusions.txt";
-my @warnings_to_suppress =
-    (
-        'unit_address_vs_reg',
-        'simple_bus_reg',
-        'unit_address_format',
-        'interrupts_property',
-        'gpios_property',
-        'label_is_string',
-        'unique_unit_address',
-        'avoid_unnecessary_addr_size'
-    );
-push @warnings_to_suppress,
-    (
-        'pci_device_reg',
-        'pci_device_bus_num',
-        'reg_format',
-        'interrupt_provider',
-        'dma_ranges_format',
-        'avoid_default_addr_size'
-    ) if (!$strict_dtc);
-
-my @dtc_opts;
-
-foreach my $warn (@warnings_to_suppress)
-{
-    push @dtc_opts, '-W', "no-$warn"
-        if (system("$DTC -W no-$warn -v >/dev/null 2>&1") == 0);
-}
-
-my $dtc_opts = join(' ', @dtc_opts);
-
-# Parse the exclusions
-
-my ($ignore_missing, $ignore_vestigial) = parse_exclusions($exclusions_file);
-my $documentation = {};
-
-# Parse the README
-
-chdir($overlaysdir);
-
-my $readme = parse_readme("README");
-
-# Parse the base dts files and overlays
-
-my $source = parse_source_files($overlaysdir, @dtsgroups, @extra_dtsgroups);
-
-# Now some build/runtime checks
-
-foreach my $group (@dtsgroups, @extra_dtsgroups)
-{
-    chdir($group->[0]);
-    foreach my $base (@{$group->[1]})
-    {
-        dtc_cpp("$base.dts", "$TMPDIR/$base.dtb");
-        if (system("ovmerge -q $base.dts") >> 8)
-        {
-            error("  Error ^ in base file $base.dts\n");
-        }
-    }
-}
-
-if (!@overlays) {
-    @overlays = sort(keys(%$source));
-
-    # Compare the two
-
-    my ($left_only, $common, $right_only) =
-        compare_sets(\@overlays, [keys(%$readme)]);
-
-    ($left_only) = compare_sets($left_only, [keys(%$ignore_missing)]);
-    ($right_only) = compare_sets($right_only, [keys(%$ignore_vestigial)]);
-
-    list_print("Overlays without documentation", $left_only);
-    list_print("Vestigial overlay documentation", $right_only);
-
-    $fail ||= (@$left_only || @$right_only);
-
-    foreach my $overlay (@$common)
-    {
-        for (my $i = 0; $i < @{$readme->{$overlay}}; $i++)
-        {
-            my $param = ${$readme->{$overlay}}[$i];
-            if ($documentation->{$param})
-            {
-                my $expansion = $readme->{$param};
-                splice(@{$readme->{$overlay}}, $i, 1, @$expansion);
-                $i += @$expansion - 1;
-            }
-        }
-        my ($l, $b, $r) = compare_sets($source->{$overlay}, $readme->{$overlay});
-        my $rpos = 0;
-        while ($rpos < @$r)
-        {
-            my $rv = $r->[$rpos];
-            if (($rv =~ s/<[i-z]>/[0-9a-fA-F]+/g) ||
-                ($rv =~ s/<[a-h]>/[a-z]/g))
-            {
-                my $lpos = 0;
-                my $found = 0;
-                while ($lpos < @$l)
-                {
-                    if ($l->[$lpos] =~ /^$rv$/)
-                    {
-                        splice(@$l, $lpos, 1);
-                        $found = 1;
-                    }
-                    else
-                    {
-                        $lpos++;
-                    }
-                }
-                splice(@$r, $rpos, 1) if ($found);
-                $rpos++ if (!$found);
-            }
-            else
-            {
-                $rpos++;
-            }
-        }
-
-        ($l) = compare_sets($l, $ignore_missing->{$overlay});
-        ($r) = compare_sets($r, $ignore_vestigial->{$overlay});
-        list_print("$overlay undocumented parameters", $l);
-        list_print("$overlay vestigial parameter documentation", $r);
-
-        $fail ||= (@$l || @$r);
-    }
-
-    # Parse the Makefile
-
-    chdir($overlaysdir);
-
-    my $makefile = parse_makefile("Makefile");
-
-    ($left_only, $common, $right_only) =
-        compare_sets(\@overlays, $makefile);
-
-    list_print("Overlays missing from the Makefile", $left_only);
-    list_print("Vestigial overlay Makefile entries", $right_only);
-
-    $fail ||= (@$left_only || @$right_only);
-}
-
-chdir($overlaysdir);
-
-dtc_cpp("overlay_map.dts", "$TMPDIR/overlay_map.dtb") if (-r "overlay_map.dts");
-
-foreach my $overlay (@overlays)
-{
-    next if ($overlay =~ /^</);
-    if (system("ovmerge -q ${overlay}-overlay.dts") >> 8)
-    {
-        error("  Error ^ in overlay $overlay\n");
-    }
-    dtc_cpp("${overlay}-overlay.dts", "$TMPDIR/$overlay.dtbo");
-}
-
-foreach my $overlay (@overlays)
-{
-    next if ($overlay =~ /^</);
-    my $overlay_props = $source->{$overlay}[0];
-    my $base;
-    while (my ($plat, $dts) = each(%platform_reps))
-    {
-        if ($overlay_props->{$plat})
-        {
-            $base = $dts;
-            last;
-        }
-    }
-    print("[ dtmerge $TMPDIR/$base.dtb $MERGED_DTB $TMPDIR/$overlay.dtbo ]\n") if ($verbose && $base);
-    if ($base && (system($DTMERGE, "$TMPDIR/$base.dtb", $MERGED_DTB, "$TMPDIR/$overlay.dtbo") >> 8))
-    {
-        error("  Error ^ in overlay $overlay\n");
-    }
-
-    dormant_checker($overlay);
-    pinctrl_checker($overlay);
-
-    my $checker = $overlay_checkers{$overlay};
-    ($checker->[0])->($overlay, $checker->[1], $source->{$overlay}) if ($checker);
-}
-
-if ($try_all)
-{
-    foreach my $overlay (@overlays)
-    {
-        next if ($overlay =~ /^</);
-        my $overlay_props = $source->{$overlay}[0];
-        foreach my $base (@base_files)
-        {
-            next if (!-f "$TMPDIR/$base.dtb");
-            next if (($overlay =~ /(wifi|bt)/) && ($base !~ /^(bcm2708-rpi-zero-w|bcm2710-rpi-zero-2|bcm2710-rpi-3-|bcm2711-rpi-(4|cm4$)|bcm2712-rpi-(5|cm5))/));
-            next if ($overlay eq 'vl805' && $base eq 'bcm2711-rpi-cm4s');
-            next if ($overlay_props->{'bcm2711'} && $base !~ /^bcm2711/);
-            next if ($overlay_props->{'bcm2712'} && $base !~ /^bcm2712/);
-            next if (system("$DTMERGE $TMPDIR/$base.dtb $MERGED_DTB $TMPDIR/$overlay.dtbo >/dev/null 2>&1") == ((-2 & 0xff) << 8));
-            print("[ dtmerge $TMPDIR/$base.dtb $MERGED_DTB $TMPDIR/$overlay.dtbo ]\n") if ($verbose);
-            error("Failed to merge $overlay with $base") if (system($DTMERGE, $verbose ? ('-d') : (), "$TMPDIR/$base.dtb", $MERGED_DTB, "$TMPDIR/$overlay.dtbo") != 0);
-        }
-    }
-}
-
-rmdir($TMPDIR);
-
-printf("%s\n", $fail ? "Failed" : "OK");
-exit($fail);
-
-sub compare_sets
-{
-    my ($l, $r) = @_;
-    my (@lonly, @both, @ronly);
-
-    my @l = ($l ? sort(not_ref(@$l)) : ());
-    my @r = ($r ? sort(not_ref(@$r)) : ());
-    my $lidx = 0;
-    my $ridx = 0;
-
-    while (($lidx < @l) && ($ridx < @r))
-    {
-        my $l = $l[$lidx];
-        my $r = $r[$ridx];
-        my $cmp = $l cmp $r;
-        if ($cmp == -1)
-        {
-            push @lonly, $l;
-            $lidx++;
-        }
-        elsif ($cmp == 1)
-        {
-            push @ronly, $r;
-            $ridx++;
-        }
-        else
-        {
-            push @both, $l;
-            $lidx++;
-            $ridx++;
-        }
-    }
-
-    push @lonly, @l[$lidx..$#l];
-    push @ronly, @r[$ridx..$#r];
-
-    return (\@lonly, \@both, \@ronly);
-}
-
-sub not_ref
-{
-    my @res;
-    foreach my $i (@_)
-    {
-        push @res, $i if (!ref $i);
-    }
-    return @res;
-}
-
-sub list_print
-{
-    my ($label, $list) = @_;
-    if (@$list)
-    {
-        print ("$label:\n");
-        foreach my $x (@$list)
-        {
-            print ("  $x\n");
-        }
-    }
-}
-
-sub parse_source_files
-{
-    my ($overlaydir, @dtsgroups) = @_;
-    my $overlays = {};
-
-    my %params;
-
-    foreach my $group (@dtsgroups)
-    {
-        chdir($group->[0]);
-
-        foreach my $file (@{$group->[1]})
-        {
-            foreach my $param (get_params($file.".dts"))
-            {
-                next if (ref $param);
-                $params{$param} = 1;
-            }
-        }
-    }
-
-    chdir($overlaydir);
-
-    $overlays->{'<The base DTB>'} = [ sort(keys(%params)) ];
-
-    foreach my $file (glob("*-overlay.dts"))
-    {
-        my $overlay = ($file =~ /^(.*)-overlay.dts$/)[0];
-
-        my $redo_cmd = `grep '// redo: ' $file`;
-        if ($redo_cmd =~ /\/\/ redo: ([^\r\n]+)/)
-        {
-            system("cp $file overlaycheck.dts");
-            system("ovmerge -r overlaycheck.dts > $overlay-overlay.dts");
-            system("rm overlaycheck.dts");
-            if (system("git diff --quiet $file") >> 8)
-            {
-                print("* '$overlay' overlay changed after redo\n");
-            }
-        }
-
-        $overlays->{ $overlay } = [ get_params($file) ];
-    }
-
-    return $overlays;
-}
-
-sub parse_readme
-{
-    my ($file) = @_;
-    my $overlays = {};
-    my $fh;
-
-    error("Failed to open '$file'") if (!open($fh, '<', $file));
-
-    my $overlay;
-    my $last_overlay = '';
-    my $params;
-    my $has_params;
-    my $in_params;
-    my $blank_count;
-    my $linenum = 0;
-    my $descr_column = 32;
-
-    while (my $line = <$fh>)
-    {
-        $linenum++;
-        chomp($line);
-        error("TABs in README ($linenum)") if ($line =~ /\t/);
-        error("Trailing whitespace in README ($linenum)") if ($line =~ /\s$/);
-        error("Line too long in README ($linenum)")
-            if (length($line) > 80 && $line !~ /^\s*[^\s]+$/);
-
-        if ($overlay && !$line)
-        {
-            $blank_count++;
-            if ($blank_count == 2)
-            {
-                error("Missing params for overlay $overlay ($linenum)") if (!$params);
-                if (ref $params)
-                {
-                    $overlays->{ $overlay } = [ sort(@{$params}) ];
-                }
-                elsif ($params)
-                {
-                    $overlays->{ $overlay } = $params;
-                }
-                else
-                {
-                    $overlays->{ $overlay } = [ ];
-                }
-
-                $overlay = undef;
-                $params = undef;
-                $in_params = 0;
-            }
-            next;
-        }
-
-        $blank_count = 0;
-
-        if (($line =~ /^\w+:\s/) && ($line !~ /^(Name|Info|Load|Params):/))
-        {
-            error("Bad label ($linenum)");
-        }
-
-        if ($line =~ /^Name:(\s*)(.*)\s*$/)
-        {
-            error("Bad formatting in README ($linenum)") if ($1 ne '   ');
-            error("Missing blank lines after overlay? ($linenum)") if ($params);
-            $overlay = $2;
-            $params = undef;
-            $in_params = 0;
-            if ($overlay !~ /^$word_pattern$/ && $overlay ne '<The base DTB>')
-            {
-                error("Illegal overlay name '$overlay' in README ($linenum)");
-            }
-
-            error("Overlay '$overlay' - order violation in README ($linenum)")
-                if (($overlay cmp $last_overlay) != 1);
-            $last_overlay = ($overlay ne '<The base DTB>') ? $overlay : ' ';
-        }
-        elsif ($line =~ /^Info:(\s*)(.*)\s*$/)
-        {
-            error("Bad formatting in README ($linenum)") if ($1 ne '   ');
-            error("Info label with no Name? ($linenum)") if (!$overlay);
-            my $info = $2;
-            if ($2 =~ /^See ($word_pattern)(?:\s+\(.*)?$/)
-            {
-                $params = $1;
-            }
-        }
-        elsif ($line =~ /^Load:(\s*)(.*)\s*$/)
-        {
-            error("Bad formatting in README ($linenum)") if ($1 ne '   ');
-            error("Load label with no Name? ($linenum)") if (!$overlay);
-            my $cmd = $2;
-            $has_params = 0;
-            if ($overlay ne '<The base DTB>')
-            {
-                if ($cmd eq '<Deprecated>')
-                {
-                    # Ignore this overlay
-                    $ignore_missing->{$overlay} = 1;
-                    $ignore_vestigial->{$overlay} = 1;
-                    $overlay = undef;
-                }
-                elsif ($cmd eq '<Documentation>')
-                {
-                    # Not a real overlay - a placeholder for common documentation
-                    $documentation->{$overlay} = 1;
-                    $ignore_missing->{$overlay} = 1;
-                    $ignore_vestigial->{$overlay} = 1;
-                    $has_params = 1;
-                }
-                else
-                {
-                    if ($cmd !~ /^dtoverlay=($word_pattern)(,<param>(?:=<val>|\[=<val>\])?)?$/)
-                    {
-                        error("Invalid Load example ($linenum)");
-                    }
-                    error("Wrong overlay name in Load example ($linenum)") if ($1 ne $overlay);
-                    $has_params = 1 if ($2);
-                }
-            }
-        }
-        elsif (defined($overlay) && ($line =~ /^Params:(.*)$/))
-        {
-            $blank_count = 0;
-            my $rol = $1;
-            $params = [];
-            $in_params = 1;
-
-            if ($rol)
-            {
-                if ($rol eq ' <None>')
-                {
-                    error("Parameter presence mismatch ($linenum)") if ($has_params);
-                    next;
-                }
-                error("Bad formatting in README ($linenum)")
-                    if ($rol !~ /^ ([^ ]+)( *)/);
-                error("Parameter presence mismatch ($linenum)") if (!$has_params);
-                my ($param, $indent2) = ($1, length($2));
-                if ($param !~ /^$readme_param_pattern$/)
-                {
-                    error("Invalid parameter name '$param' in README ($linenum)");
-                }
-                my $descr_indent = 8 + length($param) + $indent2;
-                if (($descr_indent != $descr_column) && ($indent2 != 0))
-                {
-                    error("Bad formatting in README ($linenum)");
-                }
-                push @$params, $param;
-            }
-        }
-        elsif ($in_params && ($line =~ /^( +)([^ ]+)( *)/))
-        {
-            my ($indent, $param, $indent2) = (length($1), $2, length($3));
-            if ($indent == 8)
-            {
-                my $descr_indent = 8 + length($2) + $indent2;
-                # Try to spot a comment
-                if ((($indent2 == 1) || ($indent2 == 0 && $param =~ /:$/)) &&
-                    ($descr_indent < $descr_column))
-                {
-                    $in_params = 0;
-                    next;
-                }
-                if ($param !~ /^$readme_param_pattern$/)
-                {
-                    error("Invalid parameter name '$param' in README ($linenum)");
-                }
-                if (($descr_indent != $descr_column) && ($indent2 != 0))
-                {
-                    error("Bad formatting in README ($linenum)");
-                }
-                push @$params, $param;
-            }
-            else
-            {
-                error("Bad formatting in README ($linenum)")
-                    if (($indent < 8) ||
-                        (($indent > 8) && ($indent < $descr_column)));
-            }
-        }
-    }
-
-    # Resolve inter-overlay ("See") references
-
-    foreach my $overlay (keys(%$overlays))
-    {
-        my $src = $overlays->{$overlay};
-        if (!ref $src)
-        {
-            $src = $overlays->{$src};
-            if (ref $src)
-            {
-                $overlays->{$overlay} = $src;
-            }
-            else
-            {
-                error("Chained 'See' link from $overlay to $src") if (!ref $src)
-            }
-        }
-    }
-
-    return $overlays;
-}
-
-sub parse_makefile
-{
-    my ($file) = @_;
-    my $overlays = [];
-    my $fh;
-
-    error("Failed to open '$file'") if (!open($fh, '<', $file));
-
-    push @$overlays, '<The base DTB>';
-
-    my $last_overlay = '';
-    my $linenum = 0;
-    my $in_multiline = 0;
-    while (my $line = <$fh>)
-    {
-        $linenum++;
-        chomp($line);
-        error("Trailing whitespace in Makefile ($linenum)") if ($line =~ /\s$/);
-        my $overlay;
-
-        if ($in_multiline)
-        {
-            if ($line =~ /^\t(.+)\.dtbo( \\)?$/)
-            {
-                $overlay = $1;
-                $in_multiline = 0 if (!$2);
-            }
-            else
-            {
-                error("Syntax error in Makefile ($linenum)");
-            }
-        }
-        elsif ($line =~ /^dtbo-\$\(RPI_DT_OVERLAYS\) \+= (.+)\.dtbo$/)
-        {
-            $overlay = $1;
-        }
-        elsif ($line =~ /^dtbo-\$\(CONFIG_ARCH_BCM2835\) \+= \\$/)
-        {
-            $in_multiline = 1;
-        }
-
-        if ($overlay)
-        {
-            error("Overlay '$overlay' - order violation in Makefile ($linenum)")
-                if (($overlay cmp $last_overlay) != 1);
-            push @$overlays, $overlay;
-            $last_overlay = $overlay;
-        }
-    }
-
-    return $overlays;
-}
-
-sub parse_exclusions
-{
-    my ($file) = @_;
-
-    my $missing = {};
-    my $vestigial = {};
-    my $fh;
-
-    error("Failed to open '$file'") if (!open($fh, '<', $file));
-
-    my $overlay;
-    my $linenum = 0;
-    while (my $line = <$fh>)
-    {
-        $linenum++;
-        chomp($line);
-
-        if ($line =~ /^=\s*(.+)$/)
-        {
-            $overlay = $1;
-            $missing->{$overlay} = [];
-            $vestigial->{$overlay} = [];
-        }
-        elsif ($line =~ /^-\s*(.+)$/)
-        {
-            push @{$missing->{$overlay}}, $1;
-        }
-        elsif ($line =~ /^\+\s*(.+)$/)
-        {
-            push @{$vestigial->{$overlay}}, $1;
-        }
-    }
-    return ($missing, $vestigial);
-}
-
-sub get_params
-{
-    my ($file) = @_;
-    my @params;
-    my $props = {};
-
-    print ("[ get_params $file ]\n") if ($verbose);
-
-    # Run the file through DTS to expand and clean up
-    my $cpp_cmd = join(" ", @cpp_cmd);
-    my @lines = `$cpp_cmd $file | $DTC $dtc_opts  -i overlays -@ -I dts -O dts`;
-
-    my $is_overlay = ($file =~ /-overlay\.dts$/);
-    for (my $i = 0; $i < @lines; $i++)
-    {
-        my $line = $lines[$i];
-        if ($line =~ /^\s*(__overrides__ \{|target-path\s*=\s*"\/__overrides__"\s*;)\s*$/)
-        {
-            # Support parameters pushed into the base DTB
-            if (0 && $1 =~ /^target-path/)
-            {
-                while ($lines[++$i] !~ /^\s*__overlay__\s*{\s*$/) { }
-            }
-            while ($lines[++$i] =~ /^\s*([^ \}]+)(?: = |;)/)
-            {
-                my $param = $1;
-                my $linenum = $i + 1;
-                error("Invalid parameter name '$param' in '$file'") if ($param !~ /^$word_pattern$/);
-                push @params, $param;
-                if ($lines[$i] =~ /(deadbeef|de ad be ef)/) {
-                    printf("$file: $param\n");
-                    $fail = 1;
-                }
-            }
-        }
-        elsif ($is_overlay && $line =~ /^\s*\/\s*{\s*$/)
-        {
-            while ($line !~ /^\s*compatible\s*=/)
-            {
-                $line = $lines[++$i];
-                if (!$line || $line =~ /{/)
-                {
-                    error("Missing overlay compatible string in '$file'");
-                    last;
-                }
-            }
-            my ($comp) = ($line =~ /^\s*compatible\s*=\s*(.*)?\s*;\s*$/);
-            if ($comp)
-            {
-                $comp =~ s/\s+//g;
-                if ($comp !~ /^\"brcm,(bcm2835|bcm2711|bcm2712)\"$/)
-                {
-                    error("Invalid overlay compatible string '$comp' in '$file'");
-                }
-                else
-                {
-                    $props->{$1} = 1;
-                }
-            }
-        }
-        elsif ($line =~ /^\s+(?:__symbols__|__fixups__|__local_fixups__)/)
-        {
-            last;
-        }
-    }
-
-    return ($props, sort(@params));
-}
-
-sub dtc_cpp
-{
-    my ($infile, $outfile) = @_;
-    my @dtc_cmd = (
-        $DTC,
-        @dtc_opts,
-        '-i', 'overlays', '-@', '-I', 'dts', '-O', 'dtb', '-o'
-    );
-
-    my $tmpfile = $outfile.".tmp";
-    error("Failed to CPP '$infile'")
-        if (system(@cpp_cmd, '-o', $tmpfile, $infile) != 0);
-    error("Failed to compile '$infile'")
-        if (system(@dtc_cmd, $outfile, $tmpfile) != 0);
-
-    unlink($tmpfile);
-}
-
-sub container_checker
-{
-    my ($name, $exclude, $params) = @_;
-    my $basename = $base_files[0];
-    my $base = "$TMPDIR/$basename.dtb";
-
-    foreach my $param (@$params)
-    {
-        next if (ref $param || ($exclude && $param =~ $exclude));
-        my $paramx = $param;
-        $paramx =~ s/\d$/x/;
-        my $target = `fdtget -t bx "$TMPDIR/$name.dtbo" /__overrides__ $param`;
-        chomp($target);
-        next if ($target !~ /^0 0 0 0 /);
-        error("Failed to merge $name with $basename") if (system($DTMERGE, $verbose ? ('-d') : (), $base, $MERGED_DTB, "$TMPDIR/$name.dtbo", $param) != 0);
-        my $diffs = `dtdiff $base $MERGED_DTB`;
-        if ($diffs !~ /^\+\s*$param@/m && $diffs !~ /^\+\s*$paramx@/m)
-        {
-            error("container_checker($name): parameter '$param' doesn't enable matching node");
-        }
-    }
-}
-
-sub dormant_checker
-{
-    my ($overlay) = @_;
-    my $ph;
-    my $fragnum;
-    my %is_dormant;
-    my %is_wakeable;
-    my $in_overrides = 0;
-
-    die if (!open($ph, '-|', "ovmerge -N ${overlay}-overlay.dts"));
-    while (my $line = <$ph>)
-    {
-        chomp($line);
-        if ($in_overrides)
-        {
-            if ($line =~ /^\s*};/)
-            {
-                $in_overrides = 0;
-            }
-            elsif ($line =~ /^\s*([-\w]+) = (.*?;)$/)
-            {
-                my ($param, $rol) = ($1,$2);
-                while ($rol =~ /\G<(&\w+|0)>, "([^"]+)"(?:, |;)/cg)
-                {
-                    my ($ref, $override) = ($1, $2);
-                    if ($ref eq '0')
-                    {
-                        while ($override =~ /\G([-+=!])(\d+)/cg)
-                        {
-                            my ($type, $num) = ($1, $2);
-                            $is_wakeable{$num} = 1 if ($type ne '-');
-                        }
-                    }
-                    elsif ($override =~ /=$/)
-                    {
-                        $rol =~ /\G[^,;]+(?:, |;)/cg;
-                    }
-                }
-            }
-        }
-        elsif ($line =~ /\bfragment@(\d+)\s\{$/)
-        {
-            $fragnum = $1;
-        }
-        elsif ($line =~ /\b__dormant__ \{$/)
-        {
-            $is_dormant{$fragnum} = 1;
-        }
-        elsif ($line =~ /\b__overrides__ \{$/)
-        {
-            $in_overrides = 1;
-        }
-    }
-
-    foreach my $frag (sort { $a <=> $b} keys(%is_dormant))
-    {
-        error("$overlay: fragment $frag is dormant and cannot be activated") if (!$is_wakeable{$frag});
-    }
-}
-
-sub pinctrl_checker
-{
-    my ($overlay) = @_;
-    my $ph;
-    my $fragnum;
-    my $depth = 0;
-    my $matchdepth = 0;
-    my %pinctrl_refs;
-    my ($label, $node);
-    my %fraglabels;
-    my %gpio_labels;
-    my %unlabelled_nodes;
-    my @overrides;
-    my $in_overrides = 0;
-
-    die if (!open($ph, '-|', "ovmerge -N ${overlay}-overlay.dts"));
-    while (my $line = <$ph>)
-    {
-        chomp($line);
-        # print("$depth,$matchdepth: $line\n");
-        if ($line =~ /\{$/) {
-            $depth++;
-        }
-        elsif ($line =~ /\};/) {
-            $in_overrides = 0 if ($depth == $in_overrides);
-            $depth--;
-            $matchdepth-- if ($matchdepth);
-            next;
-        }
-
-        push @overrides, $line if ($in_overrides);
-
-        $in_overrides = $depth if ($line =~ /^\s*__overrides__ \{/);
-
-        if ($line =~ /(?:(\w+): )?\bfragment@(\d+)\s\{/) {
-            my $label = $1;
-            $fraglabels{$label} = 1 if ($label);
-            $fragnum = $2;
-            $matchdepth = 1;
-        } elsif ($matchdepth == 1) {
-            if ($line =~ /target = <&gpio>/) {
-                $matchdepth++;
-            } else {
-                $matchdepth = 0;
-            }
-        } elsif ($matchdepth == 2) {
-            if ($line =~ /__(?:overlay|dormant)__ \{/) {
-                $matchdepth++;
-            } else {
-                $matchdepth = 0;
-            }
-        } elsif ($matchdepth == 3) {
-            # Must cope with multiple subnodes
-            if ($line =~ /^\s*(?:(\w+): )?([-_0-9a-zA-Z]+) \{/) {
-                $label = $1 // "";
-                $node = $2;
-                $matchdepth++;
-                if ($label) {
-                    $gpio_labels{$label} = 1;
-                } else {
-                    $unlabelled_nodes{$node} = 1;
-                }
-            } else {
-                $matchdepth = 0;
-            }
-        } elsif ($matchdepth == 4) {
-            if ($line =~ /^\s*gpio-hog;/) {
-                delete $unlabelled_nodes{$node};
-            }
-        }
-
-        # The regex is deliberately relaxed to match pinctrl-0 properties
-        # _and_ overrides that target pinctrl-0
-        while ($line =~ /\bpinctrl-0(?: |:\d+)=[^<]+<([^>]+)>/g) {
-            my $refs = $1;
-            while ($refs =~ /&(\w+)/g) {
-                $pinctrl_refs{$1} = 1;
-            }
-        }
-    }
-
-    my %bad_labels;
-    foreach my $line (@overrides) {
-        my @elements;
-        if ($line =~ /^\s*([-_a-z0-9]+) = (.*);$/) {
-            my $override = $2;
-            # 1. Split into an array of items, as separated by the commas not within strings.
-
-            while ($override =~ /\G(<[^>]+>|"[^"]*")(?:, |$)/cg) {
-                push @elements, $1;
-            }
-            for (my $i = 1; $i < @elements; $i++) {
-                my $elem = $elements[$i];
-                if ($elem =~ /^"([-_,a-z0-9]+)/) {
-                    my $prop = $1;
-                    my $target = $elements[$i - 1];
-                    if ($target =~ /^<&(\w+)>/) {
-                        my $label = $1;
-                        if ($fraglabels{$label} && $prop !~ /^target(?:-path)?/ && !$bad_labels{$label}) {
-                            error("$overlay: misused fragment label $label");
-                            $bad_labels{$label} = 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    foreach my $n (sort(keys(%unlabelled_nodes))) {
-        error("$overlay: gpio node $node has no label");
-    }
-
-    foreach my $label (sort(keys(%gpio_labels))) {
-        if (!$pinctrl_refs{$label}) {
-            error("$overlay: gpio node label $label is not referenced");
-        }
-    }
-}
-
-sub error
-{
-    print("* $_[0]\n");
-    $fail = 1;
-}
-
-sub fatal_error
-{
-    error(@_);
-    exit(1);
-}
-
-sub usage
-{
-    print("Usage: overlaycheck [<opts>] [<overlay> ...]\n");
-    print("  where <opts> can be any of:\n");
-    print("\n");
-    print("    -h  Show this help message\n");
-    print("    -s  Show more strict/picky warnings\n");
-    print("    -t  Try all overlays on all base files\n");
-    print("    -v  Enable verbose output\n");
-}
+WARNINGS_TO_SUPPRESS = [
+    'unit_address_vs_reg', 'simple_bus_reg', 'unit_address_format',
+    'interrupts_property', 'gpios_property', 'label_is_string',
+    'unique_unit_address', 'avoid_unnecessary_addr_size',
+]
+
+NON_STRICT_WARNINGS = [
+    'pci_device_reg', 'pci_device_bus_num', 'reg_format',
+    'interrupt_provider', 'dma_ranges_format', 'avoid_default_addr_size',
+]
+
+# dtmerge's exit code when a base is simply incompatible with an overlay
+# (e.g. a missing target label) - expected/acceptable in the -t sweep.
+DTMERGE_LABEL_NOT_FOUND = 254
+
+
+def usage():
+    print("Usage: overlaycheck2 [<opts>] [<overlay> ...]")
+    print("  where <opts> can be any of:")
+    print()
+    print("    -h  Show this help message")
+    print("    -s  Show more strict/picky warnings")
+    print("    -t  Try all overlays on all base files")
+    print("    -v  Enable verbose output")
+
+
+def fatal(msg):
+    print(f"* {msg}")
+    sys.exit(1)
+
+
+def list_print(label, items, reporter):
+    if items:
+        print(f"{label}:")
+        for x in sorted(items):
+            print(f"  {x}")
+        reporter.fail = True
+
+
+def find_cpp():
+    for cmd in ('arm-linux-gnueabihf-cpp', 'aarch64-linux-gnu-cpp', 'cpp'):
+        if shutil.which(cmd):
+            return cmd
+    fatal("no suitable cpp found")
+
+
+def compute_dtc_opts(dtc, strict_dtc):
+    warnings = list(WARNINGS_TO_SUPPRESS)
+    if not strict_dtc:
+        warnings += NON_STRICT_WARNINGS
+    opts = []
+    for warn in warnings:
+        probe = subprocess.run([dtc, '-W', f'no-{warn}', '-v'],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if probe.returncode == 0:
+            opts += ['-W', f'no-{warn}']
+    return opts
+
+
+def dtc_cpp(cpp, dtc, dtc_opts, kerndir, cwd, infile, outfile, reporter):
+    tmpfile = outfile + '.tmp'
+    cpp_cmd = [cpp, '-nostdinc', '-I.', f'-I{kerndir}/include', '-Ioverlays',
+               '-undef', '-D__DTS__', '-x', 'assembler-with-cpp', '-o', tmpfile, infile]
+    if subprocess.run(cpp_cmd, cwd=cwd).returncode != 0:
+        reporter.error(f"Failed to CPP '{infile}'")
+        return
+    dtc_cmd = [dtc, *dtc_opts, '-i', 'overlays', '-@', '-I', 'dts', '-O', 'dtb', '-o', outfile, tmpfile]
+    if subprocess.run(dtc_cmd, cwd=cwd).returncode != 0:
+        reporter.error(f"Failed to compile '{infile}'")
+    if os.path.exists(tmpfile):
+        os.unlink(tmpfile)
+
+
+def _ovmerge_cmd(*args):
+    # A found '...ovmerge.py' needs the interpreter spelled out explicitly;
+    # a found bare 'ovmerge' is an installed executable with its own shebang.
+    if OVMERGE_PY.endswith('.py'):
+        return [sys.executable, OVMERGE_PY, *args]
+    return [OVMERGE_PY, *args]
+
+
+def check_redo_comment(file, overlay, reporter):
+    with open(file) as f:
+        first_line = f.readline()
+    if not re.match(r'^// redo: ', first_line):
+        return
+    if OVMERGE_PY is None:
+        reporter.warn(f"'{overlay}' has a redo comment but ovmerge could not be found to check it")
+        return
+    # The redo comment's arguments name sibling overlay files by relative
+    # path (e.g. "w1-gpio-overlay.dts,gpiopin=4"), so ovmerge must run with
+    # cwd set to this file's own directory to find them.
+    result = subprocess.run(_ovmerge_cmd('-r', file),
+                            capture_output=True, text=True, cwd=os.path.dirname(file))
+    if result.returncode != 0:
+        reporter.error(f"Failed to regenerate '{overlay}' from its redo comment")
+        return
+    with open(file) as f:
+        current = f.read()
+    if result.stdout != current:
+        reporter.warn(f"'{overlay}' overlay changed after redo")
+
+
+def parse_source_files(overlaysdir, dtsgroups, reporter):
+    params_union = set()
+
+    for group_dir, bases in dtsgroups:
+        for base in bases:
+            dts_file = os.path.join(group_dir, base + '.dts')
+            try:
+                dt = dtparse(dts_file, False)
+            except OvMergeError as ex:
+                reporter.error(f"Failed to parse base file {base}.dts: {ex}")
+                continue
+            info = get_source_info(dt, dts_file, reporter, is_overlay=False)
+            params_union.update(info.params)
+
+    source = {'<The base DTB>': SourceInfo(sorted(params_union), set())}
+
+    for file in sorted(glob.glob(os.path.join(overlaysdir, '*-overlay.dts'))):
+        overlay = os.path.basename(file)[:-len('-overlay.dts')]
+        check_redo_comment(file, overlay, reporter)
+        try:
+            dt = dtparse(file, False)
+        except OvMergeError as ex:
+            reporter.error(f"Failed to parse {overlay}-overlay.dts: {ex}")
+            continue
+        source[overlay] = get_source_info(dt, file, reporter, is_overlay=True)
+
+    return source
+
+
+def expand_documentation_params(params, readme, documentation):
+    expanded = []
+    for p in params:
+        if p in documentation:
+            expanded.extend(readme.get(p, []))
+        else:
+            expanded.append(p)
+    return expanded
+
+
+def resolve_placeholders(l, r):
+    l = set(l)
+    r = set(r)
+    for rv in list(r):
+        pattern, count = re.subn(r'<[i-z]>', '[0-9a-fA-F]+', rv)
+        if not count:
+            pattern, count = re.subn(r'<[a-h]>', '[a-z]', rv)
+        if not count:
+            continue
+        regex = re.compile(f'^{pattern}$')
+        matched = {lv for lv in l if regex.match(lv)}
+        if matched:
+            l -= matched
+            r.discard(rv)
+    return l, r
+
+
+def check_readme_vs_source(source, readme, ignore_missing, ignore_vestigial, documentation, reporter):
+    overlays = set(source.keys())
+    readme_overlays = set(readme.keys())
+
+    left_only = overlays - readme_overlays - set(ignore_missing.keys())
+    right_only = readme_overlays - overlays - set(ignore_vestigial.keys())
+    list_print("Overlays without documentation", left_only, reporter)
+    list_print("Vestigial overlay documentation", right_only, reporter)
+
+    for overlay in sorted(overlays & readme_overlays):
+        readme_params = expand_documentation_params(readme[overlay], readme, documentation)
+        l = set(source[overlay].params) - set(readme_params)
+        r = set(readme_params) - set(source[overlay].params)
+
+        l, r = resolve_placeholders(l, r)
+
+        excl_missing = ignore_missing.get(overlay, [])
+        excl_vestigial = ignore_vestigial.get(overlay, [])
+        l -= set(excl_missing if isinstance(excl_missing, list) else [])
+        r -= set(excl_vestigial if isinstance(excl_vestigial, list) else [])
+
+        list_print(f"{overlay} undocumented parameters", l, reporter)
+        list_print(f"{overlay} vestigial parameter documentation", r, reporter)
+
+
+def check_makefile_vs_source(source, makefile, reporter):
+    overlays = set(source.keys())
+    makefile_set = set(makefile)
+    list_print("Overlays missing from the Makefile", overlays - makefile_set, reporter)
+    list_print("Vestigial overlay Makefile entries", makefile_set - overlays, reporter)
+
+
+def check_one_overlay(overlay, overlaysdir, tmpdir, merged_dtb, base0_dts_path,
+                       source, reporter, verbose):
+    reporter.context = overlay
+    overlay_file = os.path.join(overlaysdir, overlay + '-overlay.dts')
+
+    try:
+        dt = dtparse(overlay_file, False)
+    except OvMergeError:
+        return  # already reported by parse_source_files
+
+    info = source.get(overlay)
+
+    ctx = CheckContext(dt, overlay, overlay_file, reporter)
+    ctx.wakeable = find_wakeable_fragments(dt)
+    ctx.info = info
+    ctx.base0_dts_path = base0_dts_path
+    walk(dt.root, ctx)
+
+    platforms = info.platforms if info else set()
+
+    base = None
+    for plat, rep_base in PLATFORM_REPS.items():
+        if plat in platforms:
+            base = rep_base
+            break
+
+    if base:
+        base_dtb = os.path.join(tmpdir, base + '.dtb')
+        overlay_dtbo = os.path.join(tmpdir, overlay + '.dtbo')
+        if os.path.isfile(base_dtb) and os.path.isfile(overlay_dtbo):
+            if verbose:
+                print(f"[ dtmerge {base_dtb} {merged_dtb} {overlay_dtbo} ]")
+            cmd = [DTMERGE, base_dtb, merged_dtb, overlay_dtbo]
+            if subprocess.run(cmd).returncode != 0:
+                reporter.error(f"Error in overlay {overlay}")
+
+
+def run_try_all(overlays, source, tmpdir, merged_dtb, verbose, reporter):
+    for overlay in overlays:
+        if overlay.startswith('<'):
+            continue
+        reporter.context = overlay
+        info = source.get(overlay)
+        platforms = info.platforms if info else set()
+        overlay_dtbo = os.path.join(tmpdir, overlay + '.dtbo')
+        if not os.path.isfile(overlay_dtbo):
+            continue
+
+        for base in BASE_FILES:
+            base_dtb = os.path.join(tmpdir, base + '.dtb')
+            if not os.path.isfile(base_dtb):
+                continue
+            if re.search(r'(wifi|bt)', overlay) and not re.match(
+                    r'^(bcm2708-rpi-zero-w|bcm2710-rpi-zero-2|bcm2710-rpi-3-|'
+                    r'bcm2711-rpi-(4|cm4$)|bcm2712-rpi-(5|cm5))', base):
+                continue
+            if overlay == 'vl805' and base == 'bcm2711-rpi-cm4s':
+                continue
+            if 'bcm2711' in platforms and not base.startswith('bcm2711'):
+                continue
+            if 'bcm2712' in platforms and not base.startswith('bcm2712'):
+                continue
+
+            probe = subprocess.run([DTMERGE, base_dtb, merged_dtb, overlay_dtbo],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if probe.returncode == DTMERGE_LABEL_NOT_FOUND:
+                continue
+
+            if verbose:
+                print(f"[ dtmerge {base_dtb} {merged_dtb} {overlay_dtbo} ]")
+            cmd = [DTMERGE, *(['-d'] if verbose else []), base_dtb, merged_dtb, overlay_dtbo]
+            if subprocess.run(cmd).returncode != 0:
+                reporter.error(f"Failed to merge {overlay} with {base}")
+
+
+def find_dts_path(base, dtsgroups):
+    for group_dir, bases in dtsgroups:
+        if base in bases:
+            return os.path.join(group_dir, base + '.dts')
+    return None
+
+
+def main(argv):
+    os.environ['LD_LIBRARY_PATH'] = os.path.join(os.path.expanduser('~'), 'lib')
+
+    verbose = False
+    strict_dtc = False
+    try_all = False
+
+    args = list(argv)
+    while args and args[0].startswith('-'):
+        arg = args.pop(0)
+        if arg == '-h':
+            usage()
+            return 0
+        elif arg == '-s':
+            strict_dtc = True
+        elif arg == '-t':
+            try_all = True
+        elif arg == '-v':
+            verbose = True
+        else:
+            fatal(f"Unknown option '{arg}'")
+
+    requested_overlays = args
+    reporter = Reporter()
+
+    kerndir = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
+                              capture_output=True, text=True).stdout.strip()
+    if not kerndir or not os.path.isdir(os.path.join(kerndir, 'kernel')):
+        fatal("This isn't a Linux repository")
+
+    dtspath = os.path.join(kerndir, 'arch/arm/boot/dts/broadcom') \
+        if os.path.isfile(os.path.join(kerndir, 'arch/arm/boot/dts/broadcom/Makefile')) \
+        else os.path.join(kerndir, 'arch/arm/boot/dts')
+    dts64path = os.path.join(kerndir, 'arch/arm64/boot/dts/broadcom') \
+        if os.path.isfile(os.path.join(kerndir, 'arch/arm64/boot/dts/broadcom/Makefile')) \
+        else os.path.join(kerndir, 'arch/arm64/boot/dts')
+
+    base32, base64_, extra32, extra64 = [], [], [], []
+    for base in BASE_FILES:
+        if os.path.isfile(os.path.join(dtspath, base + '.dts')):
+            base32.append(base)
+        elif os.path.isfile(os.path.join(dts64path, base + '.dts')):
+            base64_.append(base)
+    for base in EXTRA_BASE_FILES:
+        if os.path.isfile(os.path.join(dtspath, base + '.dts')):
+            extra32.append(base)
+        elif os.path.isfile(os.path.join(dts64path, base + '.dts')):
+            extra64.append(base)
+
+    dtsgroups = [(dts64path, base64_), (dtspath, base32)]
+    extra_dtsgroups = [(dts64path, extra64), (dtspath, extra32)]
+    all_dtsgroups = dtsgroups + extra_dtsgroups
+
+    overlaysdir = os.path.join(kerndir, 'arch/arm/boot/dts/overlays')
+
+    cpp = find_cpp()
+    dtc = os.path.join(kerndir, 'scripts/dtc/dtc')
+    dtc_opts = compute_dtc_opts(dtc, strict_dtc)
+
+    exclusions_file = os.path.join(_HERE, 'overlaycheck_exclusions.txt')
+    ignore_missing, ignore_vestigial = parse_exclusions(exclusions_file, reporter)
+    documentation = {}
+
+    readme = parse_readme(os.path.join(overlaysdir, 'README'), ignore_missing,
+                           ignore_vestigial, documentation, reporter)
+
+    source = parse_source_files(overlaysdir, all_dtsgroups, reporter)
+
+    tmpdir = tempfile.mkdtemp(prefix='overlaycheck2-')
+    merged_dtb = os.path.join(tmpdir, 'merged.dtb')
+
+    try:
+        for group_dir, bases in all_dtsgroups:
+            for base in bases:
+                dtc_cpp(cpp, dtc, dtc_opts, kerndir, group_dir, base + '.dts',
+                        os.path.join(tmpdir, base + '.dtb'), reporter)
+
+        if not requested_overlays:
+            check_readme_vs_source(source, readme, ignore_missing, ignore_vestigial,
+                                    documentation, reporter)
+            makefile = parse_makefile(os.path.join(overlaysdir, 'Makefile'), reporter)
+            check_makefile_vs_source(source, makefile, reporter)
+            overlays = sorted(k for k in source.keys() if not k.startswith('<'))
+        else:
+            overlays = requested_overlays
+
+        overlay_map = os.path.join(overlaysdir, 'overlay_map.dts')
+        if os.path.isfile(overlay_map):
+            dtc_cpp(cpp, dtc, dtc_opts, kerndir, overlaysdir, 'overlay_map.dts',
+                    os.path.join(tmpdir, 'overlay_map.dtb'), reporter)
+
+        for overlay in overlays:
+            if overlay.startswith('<'):
+                continue
+            dtc_cpp(cpp, dtc, dtc_opts, kerndir, overlaysdir, overlay + '-overlay.dts',
+                    os.path.join(tmpdir, overlay + '.dtbo'), reporter)
+
+        base0_dts_path = find_dts_path(BASE_FILES[0], all_dtsgroups)
+
+        for overlay in overlays:
+            if overlay.startswith('<'):
+                continue
+            check_one_overlay(overlay, overlaysdir, tmpdir, merged_dtb, base0_dts_path,
+                               source, reporter, verbose)
+
+        if try_all:
+            run_try_all(overlays, source, tmpdir, merged_dtb, verbose, reporter)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    print("Failed" if reporter.fail else "OK")
+    return 1 if reporter.fail else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
